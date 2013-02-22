@@ -84,6 +84,13 @@ v8::Handle<v8::Value> getStringArgValue(
   );
 }
 
+v8::Handle<v8::Script> getScriptArgValue(
+  UDF_ARGS *args,
+  unsigned int i
+){
+  return v8::Script::Compile(getStringArgString(args, i));
+}
+
 v8::Handle<v8::Value> getIntArgValue(
   UDF_ARGS *args,
   unsigned int i
@@ -156,6 +163,19 @@ void assignArguments(V8RES *v8res, UDF_ARGS* args) {
   }
 }
 
+my_bool alloc_result(V8RES *v8res, unsigned long *length) {
+  if (*length <= v8res->max_result_length) return TRUE;
+  if (v8res->result != NULL) free(v8res->result);
+  v8res->result = (char *)malloc(*length);
+  if (v8res->result == NULL) {
+    v8res->max_result_length = 0;
+    LOG_ERR(MSG_RESOURCE_ALLOCATION_FAILED);
+    return FALSE;
+  }
+  else v8res->max_result_length = *length;
+  return TRUE;
+}
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -165,6 +185,7 @@ my_bool js_init(
   UDF_ARGS *args,
   char *message
 ){
+  //validate arguments
   if (args->arg_count < 1) {
     strcpy(message, MSG_MISSING_SCRIPT);
     return INIT_ERROR;
@@ -173,6 +194,7 @@ my_bool js_init(
     strcpy(message, MSG_SCRIPT_MUST_BE_STRING);
     return INIT_ERROR;
   }
+  //allocate main resource
   initid->ptr = (char *)malloc(sizeof(V8RES));
   if (initid->ptr == NULL) {
     strcpy(message, MSG_RESOURCE_ALLOCATION_FAILED);
@@ -201,7 +223,15 @@ my_bool js_init(
   }
   v8res->context->Enter();
 
+  //create and initialize arguments array
   setupArguments(v8res, args);
+
+  //set some properties of the return value.
+  initid->max_length = JS_MAX_RETURN_VALUE_LENGTH;
+  //script author can return what they like, including null
+  initid->maybe_null = TRUE;
+  //script author can always write a non-deterministic script
+  initid->const_item = FALSE;
 
   //check if we can pre-compile the script
   if (args->args[0] == FALSE) { //script argument is not a constant.
@@ -209,7 +239,7 @@ my_bool js_init(
   }
   else {                    //script argument is a constant, compile it.
     v8res->script = v8::Persistent<v8::Script>::New(
-      v8::Script::New(getStringArgString(args, 0))
+      getScriptArgValue(args, 0)
     );
     if (v8res->script.IsEmpty()) {
       char *exceptionMessage = getExceptionString(&try_catch);
@@ -221,8 +251,9 @@ my_bool js_init(
     v8res->compiled = TRUE;
   }
 
-  initid->max_length = JS_MAX_RETURN_VALUE_LENGTH;
+  //
   v8res->context->Exit();
+
   return INIT_SUCCESS;
 }
 
@@ -251,6 +282,7 @@ char *js(
   my_bool *is_null,
   my_bool *error
 ){
+  //more sacrifices to the v8 deities.
   v8::Locker locker;
   v8::TryCatch try_catch;
   V8RES *v8res = (V8RES *)initid->ptr;
@@ -267,7 +299,7 @@ char *js(
     script = v8res->script;
   }
   else {                        //compile on the fly
-    script = v8::Script::Compile(getStringArgString(args, 0));
+    script = getScriptArgValue(args, 0);
     if (script.IsEmpty()) {
       LOG_ERR(MSG_SCRIPT_COMPILATION_FAILED);
       *error = TRUE;
@@ -288,17 +320,9 @@ char *js(
   //return the value returned by the script
   v8::String::AsciiValue ascii(value);
   *length = (unsigned long)ascii.length();
-  if (*length > v8res->max_result_length) {
-    if (v8res->result != NULL) free(v8res->result);
-    v8res->result = (char *)malloc(*length);
-    if (v8res->result == NULL) {
-      v8res->max_result_length = 0;
-      LOG_ERR(MSG_RESOURCE_ALLOCATION_FAILED);
-      *error = TRUE;
-      v8res->context->Exit();
-      return NULL;
-    }
-    else v8res->max_result_length = *length;
+  if (alloc_result(v8res, length) == FALSE) {
+    *error = TRUE;
+    return NULL;
   }
   strcpy(v8res->result, *ascii);
   v8res->context->Exit();
