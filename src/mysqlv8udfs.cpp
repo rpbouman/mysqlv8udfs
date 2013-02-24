@@ -6,7 +6,8 @@
 
 #define TRUE                            1
 #define FALSE                           0
-#define JS_MAX_RETURN_VALUE_LENGTH      65535
+#define JS_MAX_RETURN_VALUE_LENGTH      65535L
+unsigned long JS_INITIAL_RETURN_VALUE_LENGTH  = 255;
 
 #define MSG_MISSING_SCRIPT              "Missing script argument."
 #define MSG_SCRIPT_MUST_BE_STRING       "Script argument must be a string."
@@ -104,10 +105,12 @@ typedef struct st_v8_resources {
   my_bool compiled;                       //1 if script already holds a script compiled in the init function
   v8::Persistent<v8::Script> script;      //handle to user script pre-compiled in the init function
   v8::Persistent<v8::Function> udf;       //
+  v8::Persistent<v8::Function> agg;       //
+  v8::Persistent<v8::Function> clear;     //
   v8::Persistent<v8::Array> arguments;    //arguments array exposed to the script
   ARG_EXTRACTOR *arg_extractors;        //array of extractor functions to transfer udf arguments to script arguments
   char *result;                          //buffer to hold the string result of executing the script
-  unsigned long long max_result_length; //number of bytes allocated for the result buffer.
+  unsigned long max_result_length;      //number of bytes allocated for the result buffer.
 } V8RES;
 
 
@@ -241,16 +244,19 @@ void assignArguments(V8RES *v8res, UDF_ARGS* args) {
 //to expand the buffer to fit the current script result.
 my_bool alloc_result(V8RES *v8res, unsigned long *length) {
   if (*length <= v8res->max_result_length) return TRUE;
-  if (v8res->result != NULL) free(v8res->result);
+  if (v8res->result != NULL) {
+    free(v8res->result);
+  }
   v8res->result = (char *)malloc(*length);
   if (v8res->result == NULL) {
     v8res->max_result_length = 0;
     LOG_ERR(MSG_RESOURCE_ALLOCATION_FAILED);
     return FALSE;
   }
-  else v8res->max_result_length = *length;
+  v8res->max_result_length = *length;
   return TRUE;
 }
+
 
 //utility to get a udf arg as a javascript string.
 v8::Handle<v8::String> getStringArgString(
@@ -269,6 +275,54 @@ v8::Handle<v8::Script> getScriptArgValue(
   unsigned int i
 ){
   return v8::Script::Compile(getStringArgString(args, i));
+}
+
+char* call_udf_return_func(
+  v8::Persistent<v8::Function> func,
+  UDF_INIT *initid,
+  UDF_ARGS *args,
+  char *result,
+  unsigned long *length,
+  my_bool *is_null,
+  my_bool *error
+){
+  V8RES *v8res = (V8RES *)initid->ptr;
+  v8::Locker locker;
+  v8::TryCatch try_catch;
+
+  v8res->context->Enter();
+  v8::HandleScope handle_scope;
+
+  updateArgumentObjects(v8res, args);
+
+  v8::Handle<v8::Value> argv[0] = {};
+  v8::Local<v8::Value> value = func->Call(
+    v8res->context->Global(), 0, argv
+  );
+  if (value.IsEmpty()) {
+    //error calling function
+    LOG_ERR(MSG_RUNTIME_SCRIPT_ERROR);
+    LOG_ERR(getExceptionString(&try_catch));
+    v8res->context->Exit();
+    *error = TRUE;
+    return NULL;
+  }
+  if (value->IsNull()) {
+    *is_null = TRUE;
+    v8res->context->Exit();
+    return NULL;
+  }
+  //return the value returned by the script
+  v8::String::AsciiValue ascii(value);
+  *length = (unsigned long)ascii.length();
+  if (alloc_result(v8res, length) == FALSE) {
+    LOG_ERR(MSG_RESOURCE_ALLOCATION_FAILED);
+    *error = TRUE;
+    return NULL;
+  }
+  strcpy(v8res->result, *ascii);
+  v8res->context->Exit();
+  return v8res->result;
 }
 
 #ifdef __cplusplus
@@ -301,6 +355,7 @@ my_bool js_init(
   V8RES *v8res = (V8RES *)initid->ptr;
   v8res->result = NULL;
   v8res->max_result_length = 0;
+  alloc_result(v8res, &JS_INITIAL_RETURN_VALUE_LENGTH);
   v8res->arg_extractors = (ARG_EXTRACTOR*)malloc(
     args->arg_count * sizeof(ARG_EXTRACTOR)
   );
@@ -374,7 +429,7 @@ my_bool jsudf_init(
   v8::TryCatch try_catch;
 
   v8res->context->Enter();
-  v8::Context::Scope context_scope(v8res->context);
+  //v8::Context::Scope context_scope(v8res->context);
   v8::HandleScope handle_scope;
 
   v8::Local<v8::Value> value = v8res->script->Run();
@@ -414,7 +469,7 @@ my_bool jsudf_init(
   setupArgumentObjects(v8res, args);
 
   //look if there is an init function, and call it.
-  member = global->Get(v8::String::New("udf_init"));
+  member = global->Get(v8::String::New("init"));
   if (member->IsFunction()) {
     func = v8::Handle<v8::Function>::Cast(member);
     v8::Handle<v8::Value> argv[0] = {};
@@ -437,6 +492,49 @@ my_bool jsudf_init(
   return INIT_SUCCESS;
 }
 
+my_bool jsagg_init(
+  UDF_INIT *initid,
+  UDF_ARGS *args,
+  char *message
+){
+  if (jsudf_init(initid, args, message) == INIT_ERROR) {
+    return INIT_ERROR;
+  }
+  V8RES *v8res = (V8RES *)initid->ptr;
+  v8::Locker locker;
+  v8::TryCatch try_catch;
+
+  v8res->context->Enter();
+  //v8::Context::Scope context_scope(v8res->context);
+  v8::HandleScope handle_scope;
+
+  v8::Local<v8::Object> global = v8res->context->Global();
+  v8::Handle<v8::Value> member;
+  v8::Handle<v8::Function> func;
+
+  member = global->Get(v8::String::New("clear"));
+  if (!member->IsFunction()) {
+    strcpy(message, MSG_NO_UDF_DEFINED);
+    v8res->context->Exit();
+    return INIT_ERROR;
+  }
+  func = v8::Handle<v8::Function>::Cast(member);
+  v8res->clear = v8::Persistent<v8::Function>::New(func);
+  v8res->compiled |= 4;
+
+  member = global->Get(v8::String::New("agg"));
+  if (!member->IsFunction()) {
+    strcpy(message, MSG_NO_UDF_DEFINED);
+    v8res->context->Exit();
+    return INIT_ERROR;
+  }
+  func = v8::Handle<v8::Function>::Cast(member);
+  v8res->agg = v8::Persistent<v8::Function>::New(func);
+  v8res->compiled |= 8;
+
+  v8res->context->Exit();
+  return INIT_SUCCESS;
+}
 
 //the udf deinit function.
 //called once by the mysql server after finishing running the row-level function
@@ -449,7 +547,7 @@ void js_deinit(
   V8RES *v8res = (V8RES *)initid->ptr;
 
   //v8 introductory voodoo incantations
-//  v8::Locker locker;
+  v8::Locker locker;
 //  v8::TryCatch try_catch;
   if (v8res->compiled & 1) {
     v8res->script.Dispose();
@@ -468,12 +566,25 @@ void jsudf_deinit(
   if (initid->ptr == NULL) return;
   //clean up v8
   V8RES *v8res = (V8RES *)initid->ptr;
-//  v8::Locker locker;
-//  v8::TryCatch try_catch;
   if (v8res->compiled & 2) {
     v8res->udf.Dispose();
     v8res->compiled = TRUE;
   }
+
+  v8::Locker locker;
+  v8::TryCatch try_catch;
+  v8res->context->Enter();
+  //v8::Context::Scope context_scope(v8res->context);
+  v8::HandleScope handle_scope;
+
+  v8::Local<v8::Object> global = v8res->context->Global();
+  v8::Handle<v8::Value> member = global->Get(v8::String::New("deinit"));
+  if (member->IsFunction()) {
+    v8::Handle<v8::Function> func = v8::Handle<v8::Function>::Cast(member);
+    v8::Handle<v8::Value> argv[0] = {};
+    func->Call(global, 0, argv);
+  }
+  v8res->context->Exit();
   //TODO: check if a udf_deinit exists, and call it.
   js_deinit(initid);
 }
@@ -483,9 +594,15 @@ void jsagg_deinit(
 ){
   if (initid->ptr == NULL) return;
   //clean up v8
-  //V8RES *v8res = (V8RES *)initid->ptr;
-//  v8::Locker locker;
-//  v8::TryCatch try_catch;
+  V8RES *v8res = (V8RES *)initid->ptr;
+  v8::Locker locker;
+  v8::TryCatch try_catch;
+  if (v8res->compiled & 8) {
+    v8res->agg.Dispose();
+  }
+  if (v8res->compiled & 4) {
+    v8res->clear.Dispose();
+  }
   jsudf_deinit(initid);
 }
 
@@ -559,6 +676,36 @@ char* jsudf(
   my_bool *error
 ){
   V8RES *v8res = (V8RES *)initid->ptr;
+  return call_udf_return_func(
+    v8res->udf,
+    initid, args,
+    result, length,
+    is_null, error
+  );
+}
+
+char* jsagg(
+  UDF_INIT *initid,
+  UDF_ARGS *args,
+  char *result,
+  unsigned long *length,
+  my_bool *is_null,
+  my_bool *error
+){
+  V8RES *v8res = (V8RES *)initid->ptr;
+  return call_udf_return_func(
+    v8res->agg,
+    initid, args,
+    result, length,
+    is_null, error
+  );
+}
+
+void jsagg_clear(
+  UDF_INIT *initid,
+  my_bool *error
+){
+  V8RES *v8res = (V8RES *)initid->ptr;
   v8::Locker locker;
   v8::TryCatch try_catch;
 
@@ -567,31 +714,29 @@ char* jsudf(
   v8::HandleScope handle_scope;
 
   v8::Handle<v8::Value> argv[0] = {};
+  v8res->clear->Call(v8res->context->Global(), 0, argv);
+  v8res->context->Exit();
+}
+
+void jsagg_add(
+  UDF_INIT *initid,
+  UDF_ARGS *args,
+  my_bool *is_null,
+  my_bool *error
+){
+  V8RES *v8res = (V8RES *)initid->ptr;
+  v8::Locker locker;
+  v8::TryCatch try_catch;
+
+  v8res->context->Enter();
+  v8::Context::Scope context_scope(v8res->context);
+  v8::HandleScope handle_scope;
+
   updateArgumentObjects(v8res, args);
 
-  v8::Local<v8::Value> value = v8res->udf->Call(
-    v8res->context->Global(), 0, argv
-  );
-  if (value.IsEmpty()) {
-    //error calling function
-    LOG_ERR(MSG_RUNTIME_SCRIPT_ERROR);
-    LOG_ERR(getExceptionString(&try_catch));
-    v8res->context->Exit();
-    *error = TRUE;
-    return NULL;
-  }
-
-  //return the value returned by the script
-  v8::String::AsciiValue ascii(value);
-  *length = (unsigned long)ascii.length();
-  if (alloc_result(v8res, length) == FALSE) {
-    LOG_ERR(MSG_RESOURCE_ALLOCATION_FAILED);
-    *error = TRUE;
-    return NULL;
-  }
-  strcpy(v8res->result, *ascii);
+  v8::Handle<v8::Value> argv[0] = {};
+  v8res->udf->Call(v8res->context->Global(), 0, argv);
   v8res->context->Exit();
-  return v8res->result;
 }
 
 #ifdef __cplusplus
