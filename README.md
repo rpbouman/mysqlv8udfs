@@ -33,7 +33,7 @@ If you ran the `install.sql` script successfully you should now have 3 new UDFs.
     +-------+-----+----------------+-----------+
     3 rows in set (0.00 sec)
 
-You should see 3 rows. 
+You should see 3 rows.
 
 Using the js UDF
 ----------------
@@ -61,10 +61,68 @@ You can pass more than one argument to the `js` function. The values of these ex
 
 Using the jsudf UDF
 -------------------
-The `jsudf` UDF exposes MySQL's native User-defined function interface to the javascript runtime. Just like the `js` function, it expects the first argument to be a string containing a snippet of javascript. 
+The `jsudf` UDF exposes MySQL's native User-defined function interface to the javascript runtime. Just like the `js` function, it expects the first argument to be a string containing a snippet of javascript.
 
-Unlike the `js` function, `jsudf` expects the script argument to be static (=the same for all rows). It compiles the script once, and runs it immediately. 
+Unlike the `js` function, `jsudf` expects the script argument to be static (=the same for all rows). It compiles the script once, and runs it immediately.
 
 After running the script, `jsudf` then looks for a javascript function called `udf`. This `udf` function is then called for each row, and its return value is returned to the MySQL query.
 
+    mysql> select jsudf('
+        -> function udf(){
+        ->   return 1+1;
+        -> ') jsudf;
+    +-------+
+    | jsudf |
+    +-------+
+    | 2     |
+    +-------+
+    1 row in set (0.00 sec)
 
+Any extra arguments passed to the `jsudf` function are available in the script. However, instead of only exposing the argument values like the `js` function does, `jsudf` exposes argument objects:
+
+    mysql> select jsudf('
+        -> function udf(){
+        ->   return JSON.stringify(this.arguments, null, 2);
+        -> }', 'string', 6.626068e-34, 299792458, 3.1415) jsudf;
+
+(The snippet above uses the javascript built-in JSON object to serialize the arguments array to a JSON string, which is returned. Note that inside the udf function, the arguments arrays is referred to using this.arguments rather than arguments.)
+
+The result is something like this:
+
+    [
+      {
+        "name": "'string'",
+        "type": 0,
+        "max_length": 6,
+        "value": "string",
+        "maybe_null": false
+      },
+      {
+        "name": "6.626068e-34",
+        "type": 1,
+        "max_length": 12,
+        "value": 6.626068e-34,
+        "maybe_null": false
+      },
+      {
+        "name": "299792458",
+        "type": 2,
+        "max_length": 9,
+        "value": 299792458,
+        "maybe_null": false
+      },
+      {
+        "name": "3.1415",
+        "type": 4,
+        "max_length": 6,
+        "value": "3.1415",
+        "maybe_null": false
+      }
+    ]
+
+Each entry in the returned array represents an argument passed to the `jsudf` function. The fields for these argument objects correspond directly to the `UDF_ARGS` structure of the MySQL native UDF interface. (See http://dev.mysql.com/doc/refman/5.6/en/udf-arguments.html for more information)
+
+The MySQL UDF interface also supports an `init` and a `deinit` function. So does the `jsudf`: if the initial script contains a `init` javascript function, then this will be called prior to any calls to the `udf` function. Likewise, if there is a `deinit` function, then it will be called after all calls to the `udf` function have been made.
+
+Using the jsagg UDF
+-------------------
