@@ -224,15 +224,16 @@ void setupArguments(V8RES *v8res, UDF_ARGS* args) {
 v8::Local<v8::Object> createArgumentObject(V8RES *v8res, UDF_ARGS *args, unsigned int i){
   v8::Local<v8::Object> argumentObject = v8::Object::New();
   argumentObject->Set(v8::String::New("name"), v8::String::New(args->attributes[i], args->attribute_lengths[i]));
+  argumentObject->Set(v8::String::New("type"), v8::Uint32::New(args->arg_type[i]));
   argumentObject->Set(v8::String::New("max_length"), v8::Number::New((double)args->lengths[i]));
-  argumentObject->Set(v8::String::New("maybe_null"), args->maybe_null[i] == TRUE ? v8::True() : v8::True());
   ARG_EXTRACTOR arg_extractor = v8res->arg_extractors[i];
   if (arg_extractor == NULL) {
     argumentObject->Set(v8::String::New("value"), v8res->arguments->Get(i - 1));
   }
   else {
     argumentObject->Set(v8::String::New("value"), v8::Null());
-   }
+  }
+  argumentObject->Set(v8::String::New("maybe_null"), args->maybe_null[i] == TRUE ? v8::True() : v8::False());
   return argumentObject;
 }
 
