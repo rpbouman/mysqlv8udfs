@@ -17,6 +17,7 @@ unsigned long JS_INITIAL_RETURN_VALUE_LENGTH  = 255;
 #define MSG_STATIC_SCRIPT_REQUIRED      "Script should be static."
 #define MSG_RUNTIME_SCRIPT_ERROR        "Runtime script error."
 #define MSG_NO_UDF_DEFINED              "Script does not define a udf."
+#define MSG_ERR_SETTING_API_CONSTANT    "Operation not supported."
 
 #define LOG_ERR(a) fprintf(stderr, "\n%s", a);
 
@@ -58,11 +59,75 @@ v8::Handle<v8::Value> getBuiltinConsole(
   return getConsoleTemplate()->NewInstance();
 }
 
+v8::Handle<v8::Value> getStringResultConstant(
+  v8::Local<v8::String> property,
+  const v8::AccessorInfo& info
+){
+  return v8::Uint32::New(STRING_RESULT);
+}
+
+v8::Handle<v8::Value> getRealResultConstant(
+  v8::Local<v8::String> property,
+  const v8::AccessorInfo& info
+){
+  return v8::Uint32::New(REAL_RESULT);
+}
+
+v8::Handle<v8::Value> getIntResultConstant(
+  v8::Local<v8::String> property,
+  const v8::AccessorInfo& info
+){
+  return v8::Uint32::New(INT_RESULT);
+}
+
+v8::Handle<v8::Value> getRowResultConstant(
+  v8::Local<v8::String> property,
+  const v8::AccessorInfo& info
+){
+  return v8::Uint32::New(ROW_RESULT);
+}
+
+v8::Handle<v8::Value> getDecimalResultConstant(
+  v8::Local<v8::String> property,
+  const v8::AccessorInfo& info
+){
+  return v8::Uint32::New(DECIMAL_RESULT);
+}
+
+v8::Handle<v8::Value> getNotFixedDecConstant(
+  v8::Local<v8::String> property,
+  const v8::AccessorInfo& info
+){
+  return v8::Uint32::New(NOT_FIXED_DEC);
+}
+
+void setConstant(
+  v8::Local<v8::String> property,
+  v8::Local<v8::Value> value,
+  const v8::AccessorInfo& info
+){
+  v8::ThrowException(
+    v8::Exception::Error(
+      v8::String::New(MSG_ERR_SETTING_API_CONSTANT)
+    )
+  );
+}
+
 //create a global object template used to initialize
 //the scripts' global execution environment.
 v8::Handle<v8::ObjectTemplate> getGlobalTemplate(){
   v8::Handle<v8::ObjectTemplate> global = v8::ObjectTemplate::New();
-  global->SetAccessor(v8::String::New("console"), getBuiltinConsole);
+  //global->SetAccessor(v8::String::New("console"), getBuiltinConsole);
+
+  //add the result constants (useful if user wants to change the argument types)
+  global->SetAccessor(v8::String::New("STRING_RESULT"), getStringResultConstant, setConstant);
+  global->SetAccessor(v8::String::New("REAL_RESULT"), getRealResultConstant, setConstant);
+  global->SetAccessor(v8::String::New("INT_RESULT"), getIntResultConstant, setConstant);
+  global->SetAccessor(v8::String::New("ROW_RESULT"), getRowResultConstant, setConstant);
+  global->SetAccessor(v8::String::New("DECIMAL_RESULT"), getDecimalResultConstant, setConstant);
+
+  //
+  global->SetAccessor(v8::String::New("NOT_FIXED_DEC"), getNotFixedDecConstant, setConstant);
   return global;
 }
 
@@ -113,20 +178,6 @@ typedef struct st_v8_resources {
   unsigned long max_result_length;      //number of bytes allocated for the result buffer.
 } V8RES;
 
-
-my_bool argument_template_init = FALSE;
-v8::Handle<v8::ObjectTemplate> argument_template;
-v8::Handle<v8::ObjectTemplate> getArgumentTemplate(){
-  if (argument_template_init == FALSE) {
-    argument_template = v8::ObjectTemplate::New();
-    argument_template->Set(v8::String::New("value"), v8::Null());
-    argument_template->Set(v8::String::New("name"), v8::Null());
-    argument_template->Set(v8::String::New("max_length"), v8::Null());
-    argument_template->Set(v8::String::New("maybe_null"), v8::True());
-    argument_template_init = TRUE;
-  }
-  return argument_template;
-}
 
 //set up arguments.
 //Any arguments beyond the initial "script" argument
