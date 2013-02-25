@@ -16,7 +16,9 @@ unsigned long JS_INITIAL_RETURN_VALUE_LENGTH  = 255;
 #define MSG_SCRIPT_COMPILATION_FAILED   "Error compiling script."
 #define MSG_STATIC_SCRIPT_REQUIRED      "Script should be static."
 #define MSG_RUNTIME_SCRIPT_ERROR        "Runtime script error."
-#define MSG_NO_UDF_DEFINED              "Script does not define a udf."
+#define MSG_NO_UDF_DEFINED              "Script does not define a function udf(){}."
+#define MSG_NO_AGG_DEFINED              "Script does not define a function agg(){}."
+#define MSG_NO_CLEAR_DEFINED            "Script does not define a function clear(){}."
 #define MSG_ERR_SETTING_API_CONSTANT    "Operation not supported."
 
 #define LOG_ERR(a) fprintf(stderr, "\n%s", a);
@@ -566,7 +568,7 @@ my_bool jsagg_init(
 
   member = global->Get(v8::String::New("clear"));
   if (!member->IsFunction()) {
-    strcpy(message, MSG_NO_UDF_DEFINED);
+    strcpy(message, MSG_NO_CLEAR_DEFINED);
     v8res->context->Exit();
     return INIT_ERROR;
   }
@@ -576,7 +578,7 @@ my_bool jsagg_init(
 
   member = global->Get(v8::String::New("agg"));
   if (!member->IsFunction()) {
-    strcpy(message, MSG_NO_UDF_DEFINED);
+    strcpy(message, MSG_NO_AGG_DEFINED);
     v8res->context->Exit();
     return INIT_ERROR;
   }
