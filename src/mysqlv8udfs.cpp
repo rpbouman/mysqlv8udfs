@@ -37,30 +37,51 @@ const char* getExceptionString(v8::TryCatch* try_catch) {
   return exception_string;
 }
 
-//this is used to implement the built-in console.log function.
-//this allows script authors to write to the mysql error log.
-v8::Handle<v8::Value> Log(const v8::Arguments& args) {
-  v8::Handle<v8::Value> value = args[0];
-  v8::String::AsciiValue ascii(value);
-  fprintf(stderr, "\n%s", *ascii);
-  return v8::Undefined();
-}
-
-//
-v8::Handle<v8::ObjectTemplate> getConsoleTemplate(){
-  v8::Handle<v8::ObjectTemplate> console = v8::ObjectTemplate::New();
-  console->Set(v8::String::New("log"), v8::FunctionTemplate::New(Log));
-  return console;
-}
-
-//create a console object
-v8::Handle<v8::Value> getBuiltinConsole(
+/**
+ *
+ *  Global Template
+ *
+ */
+v8::Handle<v8::Value> getNotFixedDecConstant(
   v8::Local<v8::String> property,
   const v8::AccessorInfo& info
-) {
-  return getConsoleTemplate()->NewInstance();
+){
+  return v8::Uint32::New(NOT_FIXED_DEC);
 }
 
+void setConstant(
+  v8::Local<v8::String> property,
+  v8::Local<v8::Value> value,
+  const v8::AccessorInfo& info
+){
+  v8::ThrowException(
+    v8::Exception::Error(
+      v8::String::New(MSG_ERR_SETTING_API_CONSTANT)
+    )
+  );
+}
+
+v8::Persistent<v8::ObjectTemplate> createGlobalTemplate(){
+  v8::Handle<v8::ObjectTemplate> globalTemplate = v8::ObjectTemplate::New();
+  //precision used for values that don't have fixed number of decimals.
+  globalTemplate->SetAccessor(v8::String::New("NOT_FIXED_DEC"), getNotFixedDecConstant, setConstant);
+  return v8::Persistent<v8::ObjectTemplate>::New(globalTemplate);
+}
+
+//create a global object template used to initialize
+//the scripts' global execution environment.
+v8::Handle<v8::ObjectTemplate> getGlobalTemplate(){
+  //static ensures we will only create the template once.
+  //TODO: create a daemon plugin that manages shared global resources
+  static v8::Persistent<v8::ObjectTemplate> globalTemplate = createGlobalTemplate();
+  return globalTemplate;
+}
+
+/**
+ *
+ *  Wrapping Item_result
+ *
+ */
 v8::Handle<v8::Value> getStringResultConstant(
   v8::Local<v8::String> property,
   const v8::AccessorInfo& info
@@ -96,41 +117,102 @@ v8::Handle<v8::Value> getDecimalResultConstant(
   return v8::Uint32::New(DECIMAL_RESULT);
 }
 
-v8::Handle<v8::Value> getNotFixedDecConstant(
-  v8::Local<v8::String> property,
-  const v8::AccessorInfo& info
-){
-  return v8::Uint32::New(NOT_FIXED_DEC);
-}
-
-void setConstant(
-  v8::Local<v8::String> property,
-  v8::Local<v8::Value> value,
-  const v8::AccessorInfo& info
-){
-  v8::ThrowException(
-    v8::Exception::Error(
-      v8::String::New(MSG_ERR_SETTING_API_CONSTANT)
-    )
-  );
-}
-
-//create a global object template used to initialize
-//the scripts' global execution environment.
-v8::Handle<v8::ObjectTemplate> getGlobalTemplate(){
-  v8::Handle<v8::ObjectTemplate> global = v8::ObjectTemplate::New();
-  //global->SetAccessor(v8::String::New("console"), getBuiltinConsole);
+v8::Persistent<v8::ObjectTemplate> createItemResultTemplate(){
+  v8::Handle<v8::ObjectTemplate> itemResultTemplate = v8::ObjectTemplate::New();
 
   //add the result constants (useful if user wants to change the argument types)
-  global->SetAccessor(v8::String::New("STRING_RESULT"), getStringResultConstant, setConstant);
-  global->SetAccessor(v8::String::New("REAL_RESULT"), getRealResultConstant, setConstant);
-  global->SetAccessor(v8::String::New("INT_RESULT"), getIntResultConstant, setConstant);
-  global->SetAccessor(v8::String::New("ROW_RESULT"), getRowResultConstant, setConstant);
-  global->SetAccessor(v8::String::New("DECIMAL_RESULT"), getDecimalResultConstant, setConstant);
+  itemResultTemplate->SetAccessor(v8::String::New("STRING_RESULT"), getStringResultConstant, setConstant);
+  itemResultTemplate->SetAccessor(v8::String::New("REAL_RESULT"), getRealResultConstant, setConstant);
+  itemResultTemplate->SetAccessor(v8::String::New("INT_RESULT"), getIntResultConstant, setConstant);
+  itemResultTemplate->SetAccessor(v8::String::New("ROW_RESULT"), getRowResultConstant, setConstant);
+  itemResultTemplate->SetAccessor(v8::String::New("DECIMAL_RESULT"), getDecimalResultConstant, setConstant);
 
-  //
-  global->SetAccessor(v8::String::New("NOT_FIXED_DEC"), getNotFixedDecConstant, setConstant);
-  return global;
+  //precision used for values that don't have fixed number of decimals.
+  itemResultTemplate->SetAccessor(v8::String::New("NOT_FIXED_DEC"), getNotFixedDecConstant, setConstant);
+  return v8::Persistent<v8::ObjectTemplate>::New(itemResultTemplate);
+}
+
+v8::Handle<v8::ObjectTemplate> getItemResultTemplate(){
+  //static ensures we will only create the template once.
+  //TODO: create a daemon plugin that manages shared global resources
+  static v8::Persistent<v8::ObjectTemplate> itemResultTemplate = createItemResultTemplate();
+  return itemResultTemplate;
+}
+
+v8::Handle<v8::Object> getItemResultInstance(){
+  return getItemResultTemplate()->NewInstance();
+}
+
+void addItemResultInstance(v8::Persistent<v8::Context> context){
+  context->Global()->Set(v8::String::New("Item_result"), getItemResultInstance());
+}
+
+/**
+ *
+ *  Wrapping UDF_INIT
+ *
+ */
+v8::Handle<v8::Value> get_const_item(v8::Local<v8::String> property, const v8::AccessorInfo &info){
+  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
+  return initid->const_item ? v8::True() : v8::False();
+}
+
+void set_const_item(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
+  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
+  initid->const_item = value->BooleanValue() ? 1 : 0;
+}
+
+v8::Handle<v8::Value> get_decimals(v8::Local<v8::String> property, const v8::AccessorInfo &info){
+  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
+  return v8::Uint32::New(initid->decimals);
+}
+
+void set_decimals(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
+  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
+  initid->decimals = value->Uint32Value();
+}
+
+v8::Handle<v8::Value> get_max_length(v8::Local<v8::String> property, const v8::AccessorInfo &info){
+  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
+  return v8::Integer::New(initid->max_length);
+}
+
+void set_max_length(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
+  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
+  initid->max_length = value->IntegerValue();
+}
+
+v8::Handle<v8::Value> get_maybe_null(v8::Local<v8::String> property, const v8::AccessorInfo &info){
+  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
+  return initid->maybe_null ? v8::True() : v8::False();
+}
+
+void set_maybe_null(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
+  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
+  initid->maybe_null = value->BooleanValue() ? 1 : 0;
+}
+
+v8::Persistent<v8::ObjectTemplate> createUdfInitTemplate() {
+  v8::Handle<v8::ObjectTemplate> udfInitTemplate = v8::ObjectTemplate::New();
+  udfInitTemplate->SetInternalFieldCount(1);
+  udfInitTemplate->SetAccessor(v8::String::New("const_item"), get_const_item, set_const_item);
+  udfInitTemplate->SetAccessor(v8::String::New("decimals"), get_decimals, set_decimals);
+  udfInitTemplate->SetAccessor(v8::String::New("max_length"), get_max_length, set_max_length);
+  udfInitTemplate->SetAccessor(v8::String::New("maybe_null"), get_maybe_null, set_maybe_null);
+  return v8::Persistent<v8::ObjectTemplate>::New(udfInitTemplate);
+}
+
+v8::Handle<v8::ObjectTemplate> getUdfInitTemplate(){
+  //static ensures we will only create the template once.
+  //TODO: create a daemon plugin that manages shared global resources
+  static v8::Persistent<v8::ObjectTemplate> udfInitTemplate = createUdfInitTemplate();
+  return udfInitTemplate;
+}
+
+v8::Local<v8::Object> newUdfInit(UDF_INIT* initid) {
+  v8::Local<v8::Object> _initid = getUdfInitTemplate()->NewInstance();
+  _initid->SetInternalField(0, v8::External::New(initid));
+  return _initid;
 }
 
 //ARG_EXTRACTOR = pointer to an extractor function
@@ -429,6 +511,7 @@ my_bool js_init(
     return INIT_ERROR;
   }
   v8res->context->Enter();
+  addItemResultInstance(v8res->context);
 
   //create and initialize arguments array
   setupArguments(v8res, args);
@@ -509,15 +592,7 @@ my_bool jsudf_init(
   v8res->compiled |= 2;
 
   //set UDF_INIT variables:
-  v8::Local<v8::String> _maybe_null = v8::String::New("maybe_null");
-  v8::Local<v8::String> _max_length = v8::String::New("max_length");
-  v8::Local<v8::String> _decimals = v8::String::New("decimals");
-  v8::Local<v8::String> _const_item = v8::String::New("const_item");
-
-  global->Set(_maybe_null, initid->maybe_null ? v8::True() : v8::False());
-  global->Set(_max_length, v8::Number::New((double)initid->max_length));
-  global->Set(_decimals, v8::Number::New((double)initid->decimals));
-  global->Set(_const_item, initid->const_item ? v8::True() : v8::False());
+  global->Set(v8::String::New("UDF_INIT"), newUdfInit(initid));
 
   //setup argument objects
   setupArgumentObjects(v8res, args);
@@ -533,11 +608,6 @@ my_bool jsudf_init(
       v8res->context->Exit();
       return INIT_ERROR;
     }
-    //write the values back to udf init.
-    initid->maybe_null = global->Get(_maybe_null)->IsTrue() ? 1 : 0;
-    initid->const_item = global->Get(_const_item)->IsTrue() ? 1 : 0;
-    initid->decimals = (unsigned int)global->Get(_decimals)->ToNumber()->Value();
-    initid->max_length = (unsigned int)global->Get(_max_length)->ToNumber()->Value();
     //
     updateArgsFromArgumentObjects(v8res, args);
   }
