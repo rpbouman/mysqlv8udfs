@@ -13,14 +13,27 @@
 unsigned long JS_INITIAL_RETURN_VALUE_LENGTH  = 255;
 
 static v8::Persistent<v8::ObjectTemplate> globalTemplate;
-static v8::Persistent<v8::ObjectTemplate> udfConstantsTemplate;
-static v8::Persistent<v8::ObjectTemplate> udfInitTemplate;
+static v8::Persistent<v8::String> str_arguments;
+static v8::Persistent<v8::String> str_const_item;
+static v8::Persistent<v8::String> str_decimals;
+static v8::Persistent<v8::String> str_maybe_null;
+static v8::Persistent<v8::String> str_max_length;
+static v8::Persistent<v8::String> str_name;
+static v8::Persistent<v8::String> str_type;
+static v8::Persistent<v8::String> str_value;
+static v8::Persistent<v8::String> str_STRING_RESULT;
+static v8::Persistent<v8::String> str_INT_RESULT;
+static v8::Persistent<v8::String> str_DECIMAL_RESULT;
+static v8::Persistent<v8::String> str_REAL_RESULT;
+static v8::Persistent<v8::String> str_ROW_RESULT;
+static v8::Persistent<v8::String> str_NOT_FIXED_DEC;
 static v8::Persistent<v8::Context> jsDaemonContext;
 static v8::HeapStatistics *js_daemon_heap_statistics;
 
 #define MSG_MISSING_SCRIPT              "Missing script argument."
 #define MSG_SCRIPT_MUST_BE_STRING       "Script argument must be a string."
-#define MSG_RESOURCE_ALLOCATION_FAILED  "Failed to allocate v8 resources."
+#define MSG_V8_ALLOCATION_FAILED        "Failed to allocate v8 resources."
+#define MSG_RESULT_ALLOCATION_FAILED    "Failed to allocate result buffer."
 #define MSG_CREATE_CONTEXT_FAILED       "Failed to create context."
 #define MSG_SCRIPT_COMPILATION_FAILED   "Error compiling script."
 #define MSG_STATIC_SCRIPT_REQUIRED      "Script should be static."
@@ -57,31 +70,19 @@ const char* getExceptionString(v8::TryCatch* try_catch) {
 typedef v8::Handle<v8::Value> (*ARG_EXTRACTOR)(UDF_ARGS*, unsigned int);
 
 //extractor to get a STRING udf argument as a javascript string.
-v8::Handle<v8::Value> getStringArgValue(
-  UDF_ARGS *args,
-  unsigned int i
-){
-  return v8::String::New(
-    args->args[i],
-    args->lengths[i]
-  );
+v8::Handle<v8::Value> getStringArgValue(UDF_ARGS *args, unsigned int i){
+  return v8::String::New(args->args[i], args->lengths[i]);
 }
 
 //extractor to get a INT udf argument as a javascript number (or int)
-v8::Handle<v8::Value> getIntArgValue(
-  UDF_ARGS *args,
-  unsigned int i
-){
+v8::Handle<v8::Value> getIntArgValue(UDF_ARGS *args, unsigned int i){
   long long int_val = *((long long *)args->args[i]);
   if (int_val >> 31) return v8::Number::New((double)int_val);
   else return v8::Integer::New(int_val);
 }
 
 //extractor to get a REAL udf argument as a javascript number
-v8::Handle<v8::Value> getRealArgValue(
-  UDF_ARGS *args,
-  unsigned int i
-){
+v8::Handle<v8::Value> getRealArgValue(UDF_ARGS *args, unsigned int i){
   return v8::Number::New(*((double *)args->args[i]));
 }
 
@@ -95,6 +96,7 @@ typedef struct st_v8_resources {
   v8::Persistent<v8::Function> agg;       //
   v8::Persistent<v8::Function> clear;     //
   v8::Persistent<v8::Array> arguments;    //arguments array exposed to the script
+  v8::Handle<v8::Value> *arg_values;  //argument values passed to udf functions
   ARG_EXTRACTOR *arg_extractors;        //array of extractor functions to transfer udf arguments to script arguments
   char *result;                          //buffer to hold the string result of executing the script
   unsigned long max_result_length;      //number of bytes allocated for the result buffer.
@@ -104,12 +106,23 @@ typedef struct st_v8_resources {
 //Any arguments beyond the initial "script" argument
 //are available in a global array called arguments
 //this func is called in the init function to create that array.
-void setupArguments(V8RES *v8res, UDF_ARGS* args) {
-  v8::Local<v8::Array> arguments = v8::Array::New(args->arg_count - 1);
-  v8res->context->Global()->Set(
-    v8::String::New("arguments"),
-    arguments
+my_bool setupArguments(V8RES *v8res, UDF_ARGS* args, char *message) {
+  //allocate room for extractors
+  v8res->arg_extractors = (ARG_EXTRACTOR*)malloc(
+    args->arg_count * sizeof(ARG_EXTRACTOR)
   );
+  if (v8res->arg_extractors == NULL) {
+    strcpy(message, MSG_V8_ALLOCATION_FAILED);
+    return INIT_ERROR;
+  }
+  v8::Handle<v8::Value> arg_value;
+
+  v8::Local<v8::Array> arguments = v8::Array::New(args->arg_count - 1);
+  if (arguments.IsEmpty()) {
+    strcpy(message, MSG_V8_ALLOCATION_FAILED);
+    return INIT_ERROR;
+  }
+  v8res->context->Global()->Set(str_arguments, arguments);
   v8res->arguments = v8::Persistent<v8::Array>::New(arguments);
   for (unsigned int i = 1; i < args->arg_count; i++) {
     //for each argument, find a suitable extractor.
@@ -143,6 +156,7 @@ void setupArguments(V8RES *v8res, UDF_ARGS* args) {
       //this is a non-constant argument.
       //store the extractor so we can call it in the row-level function
       v8res->arg_extractors[i] = arg_extractor;
+      arg_value = v8::Null();
     }
     else {
       //this is a constant argument.
@@ -152,45 +166,56 @@ void setupArguments(V8RES *v8res, UDF_ARGS* args) {
         //but in this phase, the coercion has not taken place yet,
         //so if we need the value (as is the case now)
         //we need to use the old string extractor
-        v8res->arguments->Set(i - 1, getStringArgValue(args, i)->ToNumber());
+        arg_value = getStringArgValue(args, i)->ToNumber();
       }
       else {
-        v8res->arguments->Set(i - 1, (*arg_extractor)(args, i));
+        arg_value = (*arg_extractor)(args, i);
       }
       v8res->arg_extractors[i] = NULL;
     }
+    v8res->arguments->Set(i - 1, arg_value);
   }
+  return INIT_SUCCESS;
 }
 
 v8::Local<v8::Object> createArgumentObject(V8RES *v8res, UDF_ARGS *args, unsigned int i){
   v8::Local<v8::Object> argumentObject = v8::Object::New();
-  argumentObject->Set(v8::String::New("name"), v8::String::New(args->attributes[i], args->attribute_lengths[i]));
-  argumentObject->Set(v8::String::New("type"), v8::Uint32::New(args->arg_type[i]));
-  argumentObject->Set(v8::String::New("max_length"), v8::Number::New((double)args->lengths[i]));
+  argumentObject->Set(str_name, v8::String::New(args->attributes[i], args->attribute_lengths[i]));
+  argumentObject->Set(str_type, v8::Uint32::New(args->arg_type[i]));
+  argumentObject->Set(str_max_length, v8::Number::New((double)args->lengths[i]));
   ARG_EXTRACTOR arg_extractor = v8res->arg_extractors[i];
+  v8::Handle<v8::Value> arg_value;
   if (arg_extractor == NULL) {
-    argumentObject->Set(v8::String::New("value"), v8res->arguments->Get(i - 1));
-    argumentObject->Set(v8::String::New("const_item"), v8::True());
+    //argumentObject->Set(str_value, v8res->arguments->Get(i - 1));
+    argumentObject->Set(str_const_item, v8::True());
   }
   else {
-    argumentObject->Set(v8::String::New("value"), v8::Null());
-    argumentObject->Set(v8::String::New("const_item"), v8::False());
+    //argumentObject->Set(str_value, v8::Null());
+    argumentObject->Set(str_const_item, v8::False());
   }
-
-  argumentObject->Set(v8::String::New("maybe_null"), args->maybe_null[i] == TRUE ? v8::True() : v8::False());
+  argumentObject->Set(str_maybe_null, args->maybe_null[i] == TRUE ? v8::True() : v8::False());
+  arg_value = v8res->arguments->Get(i - 1);
+  v8res->arg_values[i-1] = arg_value;
+  argumentObject->Set(str_value, arg_value);
   return argumentObject;
 }
 
-void setupArgumentObjects(V8RES *v8res, UDF_ARGS* args){
+my_bool setupArgumentObjects(V8RES *v8res, UDF_ARGS* args, char *message){
+  //allocate room for value array
+  v8res->arg_values = (v8::Handle<v8::Value> *)malloc((args->arg_count - 1) * sizeof(v8::Handle<v8::Value>));
+  if (v8res->arg_values == NULL) {
+    strcpy(message, MSG_V8_ALLOCATION_FAILED);
+    return INIT_ERROR;
+  }
   for (unsigned int i = 1; i < args->arg_count; i++) {
     v8res->arguments->Set(i - 1, createArgumentObject(v8res, args, i));
   }
+  return INIT_SUCCESS;
 }
 
 void updateArgumentObjects(V8RES *v8res, UDF_ARGS* args){
   ARG_EXTRACTOR arg_extractor;
   v8::Handle<v8::Value> val;
-  v8::Local<v8::String> valkey = v8::String::New("value");
   for (unsigned int i = 1; i < args->arg_count; i++) {
     arg_extractor = v8res->arg_extractors[i];
     //if this is a constant argument,
@@ -200,35 +225,34 @@ void updateArgumentObjects(V8RES *v8res, UDF_ARGS* args){
     //extract and store the argument value
     if (args->args[i] == NULL) val = v8::Null();
     else val = (*arg_extractor)(args, i);
-    v8res->arguments->Get(i - 1)->ToObject()->Set(valkey, val);
+    v8res->arg_values[i - 1] = val;
+    v8res->arguments->Get(i - 1)->ToObject()->Set(str_value, val);
   }
 }
 
 //this is called in the init after running the js init.
 //this reads back the type field of the argument objects
 my_bool updateArgsFromArgumentObjects(V8RES *v8res, UDF_ARGS *args){
-  v8::Local<v8::String> typeKey = v8::String::New("type");
-  v8::Local<v8::String> valueKey = v8::String::New("value");
   v8::Local<v8::Value> type;
   v8::Local<v8::Uint32> intType;
   v8::Local<v8::Object> argument;
   Item_result _type;
   for (unsigned int i = 1; i < args->arg_count; i++) {
     argument = v8res->arguments->Get(i - 1)->ToObject();
-    _type = (Item_result)argument->Get(typeKey)->ToUint32()->Value();
+    _type = (Item_result)argument->Get(str_type)->ToUint32()->Value();
     if (_type == args->arg_type[i]) continue;
     switch (_type) {
       case STRING_RESULT:
         args->arg_type[i] = _type;
         if (args->args[i] != NULL) {
-          argument->Set(valueKey, argument->Get(valueKey)->ToString());
+          argument->Set(str_value, argument->Get(str_value)->ToString());
         }
         break;
       case REAL_RESULT:
       case INT_RESULT:
         args->arg_type[i] = _type;
         if (args->args[i] != NULL) {
-          argument->Set(valueKey, argument->Get(valueKey)->ToNumber());
+          argument->Set(str_value, argument->Get(str_value)->ToNumber());
         }
         break;
       case DECIMAL_RESULT:
@@ -263,37 +287,28 @@ void assignArguments(V8RES *v8res, UDF_ARGS* args) {
 //this is called in the row-level function
 //to expand the buffer to fit the current script result.
 my_bool alloc_result(V8RES *v8res, unsigned long *length) {
-  if (*length <= v8res->max_result_length) return TRUE;
+  if (*length <= v8res->max_result_length) return INIT_SUCCESS;
   if (v8res->result != NULL) {
     free(v8res->result);
   }
   v8res->result = (char *)malloc(*length);
   if (v8res->result == NULL) {
     v8res->max_result_length = 0;
-    LOG_ERR(MSG_RESOURCE_ALLOCATION_FAILED);
-    return FALSE;
+    LOG_ERR(MSG_RESULT_ALLOCATION_FAILED);
+    return INIT_ERROR;
   }
   v8res->max_result_length = *length;
-  return TRUE;
+  return INIT_SUCCESS;
 }
 
 
 //utility to get a udf arg as a javascript string.
-v8::Handle<v8::String> getStringArgString(
-  UDF_ARGS *args,
-  unsigned int i
-){
-  return v8::String::New(
-    args->args[i],
-    args->lengths[i]
-  );
+v8::Handle<v8::String> getStringArgString(UDF_ARGS *args, unsigned int i){
+  return v8::String::New(args->args[i], args->lengths[i]);
 }
 
 //utility to get a udf arg as a script handle.
-v8::Handle<v8::Script> getScriptArgValue(
-  UDF_ARGS *args,
-  unsigned int i
-){
+v8::Handle<v8::Script> getScriptArgValue(UDF_ARGS *args, unsigned int i){
   return v8::Script::Compile(getStringArgString(args, i));
 }
 
@@ -308,16 +323,14 @@ char* call_udf_return_func(
 ){
   V8RES *v8res = (V8RES *)initid->ptr;
   v8::Locker locker;
-  v8::TryCatch try_catch;
-
   v8res->context->Enter();
   v8::HandleScope handle_scope;
+  v8::TryCatch try_catch;
 
   updateArgumentObjects(v8res, args);
 
-  v8::Handle<v8::Value> argv[0] = {};
   v8::Local<v8::Value> value = func->Call(
-    v8res->context->Global(), 0, argv
+    v8res->context->Global(), args->arg_count - 1, v8res->arg_values
   );
   if (value.IsEmpty()) {
     //error calling function
@@ -335,8 +348,8 @@ char* call_udf_return_func(
   //return the value returned by the script
   v8::String::AsciiValue ascii(value);
   *length = (unsigned long)ascii.length();
-  if (alloc_result(v8res, length) == FALSE) {
-    LOG_ERR(MSG_RESOURCE_ALLOCATION_FAILED);
+  if (alloc_result(v8res, length) == INIT_ERROR) {
+    LOG_ERR(MSG_RESULT_ALLOCATION_FAILED);
     *error = TRUE;
     return NULL;
   }
@@ -350,7 +363,7 @@ char* call_udf_return_func(
  */
 v8::Persistent<v8::ObjectTemplate> createGlobalTemplate(){
   v8::Handle<v8::ObjectTemplate> _template = v8::ObjectTemplate::New();
-  //precision used for values that don't have fixed number of decimals.
+  _template->SetInternalFieldCount(1);
   return v8::Persistent<v8::ObjectTemplate>::New(_template);
 }
 
@@ -368,11 +381,7 @@ v8::Handle<v8::ObjectTemplate> getGlobalTemplate(){
  *  Wrapping useful udf constants
  *
  */
-void setConstant(
-  v8::Local<v8::String> property,
-  v8::Local<v8::Value> value,
-  const v8::AccessorInfo& info
-){
+void setConstant(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
   v8::ThrowException(
     v8::Exception::Error(
       v8::String::New(MSG_ERR_SETTING_API_CONSTANT)
@@ -380,74 +389,37 @@ void setConstant(
   );
 }
 
-v8::Handle<v8::Value> getStringResultConstant(
-  v8::Local<v8::String> property,
-  const v8::AccessorInfo& info
-){
+v8::Handle<v8::Value> getStringResultConstant(v8::Local<v8::String> property, const v8::AccessorInfo& info){
   return v8::Uint32::New(STRING_RESULT);
 }
 
-v8::Handle<v8::Value> getRealResultConstant(
-  v8::Local<v8::String> property,
-  const v8::AccessorInfo& info
-){
+v8::Handle<v8::Value> getRealResultConstant(v8::Local<v8::String> property, const v8::AccessorInfo& info){
   return v8::Uint32::New(REAL_RESULT);
 }
 
-v8::Handle<v8::Value> getIntResultConstant(
-  v8::Local<v8::String> property,
-  const v8::AccessorInfo& info
-){
+v8::Handle<v8::Value> getIntResultConstant(v8::Local<v8::String> property, const v8::AccessorInfo& info){
   return v8::Uint32::New(INT_RESULT);
 }
 
-v8::Handle<v8::Value> getRowResultConstant(
-  v8::Local<v8::String> property,
-  const v8::AccessorInfo& info
-){
+v8::Handle<v8::Value> getRowResultConstant(v8::Local<v8::String> property, const v8::AccessorInfo& info){
   return v8::Uint32::New(ROW_RESULT);
 }
 
-v8::Handle<v8::Value> getDecimalResultConstant(
-  v8::Local<v8::String> property,
-  const v8::AccessorInfo& info
-){
+v8::Handle<v8::Value> getDecimalResultConstant(v8::Local<v8::String> property, const v8::AccessorInfo& info){
   return v8::Uint32::New(DECIMAL_RESULT);
 }
 
-v8::Handle<v8::Value> getNotFixedDecConstant(
-  v8::Local<v8::String> property,
-  const v8::AccessorInfo& info
-){
+v8::Handle<v8::Value> getNotFixedDecConstant(v8::Local<v8::String> property, const v8::AccessorInfo& info){
   return v8::Uint32::New(NOT_FIXED_DEC);
 }
 
-v8::Persistent<v8::ObjectTemplate> createUdfConstantsTemplate(){
-  v8::Handle<v8::ObjectTemplate> udfConstantsTemplate = v8::ObjectTemplate::New();
-
-  //add the result constants (useful if user wants to change the argument types)
-  udfConstantsTemplate->SetAccessor(v8::String::New("STRING_RESULT"), getStringResultConstant, setConstant);
-  udfConstantsTemplate->SetAccessor(v8::String::New("REAL_RESULT"), getRealResultConstant, setConstant);
-  udfConstantsTemplate->SetAccessor(v8::String::New("INT_RESULT"), getIntResultConstant, setConstant);
-  udfConstantsTemplate->SetAccessor(v8::String::New("ROW_RESULT"), getRowResultConstant, setConstant);
-  udfConstantsTemplate->SetAccessor(v8::String::New("DECIMAL_RESULT"), getDecimalResultConstant, setConstant);
-  udfConstantsTemplate->SetAccessor(v8::String::New("NOT_FIXED_DEC"), getNotFixedDecConstant, setConstant);
-
-  return v8::Persistent<v8::ObjectTemplate>::New(udfConstantsTemplate);
-}
-
-v8::Handle<v8::ObjectTemplate> getUdfConstantsTemplate(){
-  //static ensures we will only create the template once.
-  //TODO: create a daemon plugin that manages shared global resources
-  return udfConstantsTemplate;
-}
-
-v8::Handle<v8::Object> getUdfConstantsInstance(){
-  return getUdfConstantsTemplate()->NewInstance();
-}
-
-void addUdfConstantsInstance(v8::Persistent<v8::Context> context){
-  context->Global()->Set(v8::String::New("udf_constants"), getUdfConstantsInstance());
+void add_udf_constants(v8::Local<v8::Object> object){
+  object->SetAccessor(str_STRING_RESULT, getStringResultConstant, setConstant);
+  object->SetAccessor(str_REAL_RESULT, getRealResultConstant, setConstant);
+  object->SetAccessor(str_INT_RESULT, getIntResultConstant, setConstant);
+  object->SetAccessor(str_ROW_RESULT, getRowResultConstant, setConstant);
+  object->SetAccessor(str_DECIMAL_RESULT, getDecimalResultConstant, setConstant);
+  object->SetAccessor(str_NOT_FIXED_DEC, getNotFixedDecConstant, setConstant);
 }
 
 /**
@@ -495,26 +467,12 @@ void set_maybe_null(v8::Local<v8::String> property, v8::Local<v8::Value> value, 
   initid->maybe_null = value->BooleanValue() ? 1 : 0;
 }
 
-v8::Persistent<v8::ObjectTemplate> createUdfInitTemplate() {
-  v8::Handle<v8::ObjectTemplate> udfInitTemplate = v8::ObjectTemplate::New();
-  udfInitTemplate->SetInternalFieldCount(1);
-  udfInitTemplate->SetAccessor(v8::String::New("const_item"), get_const_item, set_const_item);
-  udfInitTemplate->SetAccessor(v8::String::New("decimals"), get_decimals, set_decimals);
-  udfInitTemplate->SetAccessor(v8::String::New("max_length"), get_max_length, set_max_length);
-  udfInitTemplate->SetAccessor(v8::String::New("maybe_null"), get_maybe_null, set_maybe_null);
-  return v8::Persistent<v8::ObjectTemplate>::New(udfInitTemplate);
-}
-
-v8::Handle<v8::ObjectTemplate> getUdfInitTemplate(){
-  //static ensures we will only create the template once.
-  //TODO: create a daemon plugin that manages shared global resources
-  return udfInitTemplate;
-}
-
-v8::Local<v8::Object> newUdfInit(UDF_INIT* initid) {
-  v8::Local<v8::Object> _initid = getUdfInitTemplate()->NewInstance();
-  _initid->SetInternalField(0, v8::External::New(initid));
-  return _initid;
+void add_udf_init_accessors(v8::Local<v8::Object> object, UDF_INIT* initid){
+  object->SetInternalField(0, v8::External::New(initid));
+  object->SetAccessor(str_const_item, get_const_item, set_const_item);
+  object->SetAccessor(str_decimals, get_decimals, set_decimals);
+  object->SetAccessor(str_max_length, get_max_length, set_max_length);
+  object->SetAccessor(str_maybe_null, get_maybe_null, set_maybe_null);
 }
 
 /**
@@ -523,37 +481,6 @@ v8::Local<v8::Object> newUdfInit(UDF_INIT* initid) {
 v8::HeapStatistics *createHeapStatistics(){
   v8::HeapStatistics *heapStatistics = new v8::HeapStatistics();
   return heapStatistics;
-}
-
-struct st_mysql_daemon js_daemon_info = {
-  MYSQL_DAEMON_INTERFACE_VERSION
-};
-
-static int js_daemon_plugin_init(MYSQL_PLUGIN){
-  LOG_ERR(MSG_JS_DAEMON_STARTUP);
-  v8::Locker locker;
-  v8::HandleScope handle_scope;
-  js_daemon_heap_statistics = createHeapStatistics();
-  jsDaemonContext = v8::Context::New();
-  jsDaemonContext->Enter();
-  globalTemplate = createGlobalTemplate();
-  udfConstantsTemplate = createUdfConstantsTemplate();
-  udfInitTemplate = createUdfInitTemplate();
-  jsDaemonContext->Exit();
-  return 0;
-}
-
-static int js_daemon_plugin_deinit(MYSQL_PLUGIN){
-  v8::Locker locker;
-  v8::HandleScope handle_scope;
-  jsDaemonContext->Enter();
-  globalTemplate.Dispose();
-  udfConstantsTemplate.Dispose();
-  udfInitTemplate.Dispose();
-  jsDaemonContext->Exit();
-  jsDaemonContext.Dispose();
-  LOG_ERR(MSG_JS_DAEMON_SHUTDOWN);
-  return 0;
 }
 
 void updateHeapStatistics(){
@@ -636,18 +563,8 @@ struct st_mysql_show_var js_daemon_status_vars[] =
 static struct st_mysql_sys_var *js_daemon_system_vars[]= {
   NULL
 };
-#ifdef __cplusplus
-extern "C" {
-#endif
 
-//the UDF init function.
-//called once by the mysql server
-//before running the udf row level function
-my_bool js_init(
-  UDF_INIT *initid,
-  UDF_ARGS *args,
-  char *message
-){
+my_bool js_check_arguments(UDF_ARGS *args, char *message){
   //validate arguments
   if (args->arg_count < 1) {
     strcpy(message, MSG_MISSING_SCRIPT);
@@ -657,29 +574,81 @@ my_bool js_init(
     strcpy(message, MSG_SCRIPT_MUST_BE_STRING);
     return INIT_ERROR;
   }
-  //allocate main resource
+  return INIT_SUCCESS;
+}
+
+my_bool js_alloc_resources(UDF_INIT *initid, UDF_ARGS *args, char *message) {
   initid->ptr = (char *)malloc(sizeof(V8RES));
   if (initid->ptr == NULL) {
-    strcpy(message, MSG_RESOURCE_ALLOCATION_FAILED);
+    strcpy(message, MSG_V8_ALLOCATION_FAILED);
     return INIT_ERROR;
   }
   V8RES *v8res = (V8RES *)initid->ptr;
+  v8res->arg_values = NULL;
+  v8res->arg_extractors = NULL;
+  //allocate room for result (return value)
   v8res->result = NULL;
   v8res->max_result_length = 0;
-  alloc_result(v8res, &JS_INITIAL_RETURN_VALUE_LENGTH);
-  v8res->arg_extractors = (ARG_EXTRACTOR*)malloc(
-    args->arg_count * sizeof(ARG_EXTRACTOR)
-  );
-  if (v8res->arg_extractors == NULL) {
-    strcpy(message, MSG_RESOURCE_ALLOCATION_FAILED);
+  if (alloc_result(v8res, &JS_INITIAL_RETURN_VALUE_LENGTH) == INIT_ERROR) {
+    strcpy(message, MSG_RESULT_ALLOCATION_FAILED);
     return INIT_ERROR;
   }
+
+  return INIT_SUCCESS;
+}
+
+void js_set_initid_defaults(UDF_INIT *initid) {
+  //set default properties of the return value.
+  initid->max_length = JS_MAX_RETURN_VALUE_LENGTH;  //blob. for varchar, use smaller max_length
+  initid->maybe_null = TRUE;                        //script author can return what they like, including null
+  initid->const_item = FALSE;                       //script author can always write a non-deterministic script
+}
+
+my_bool js_pre_compile(UDF_INIT *initid, UDF_ARGS *args, char *message){
+  //check if we can pre-compile the script
+  V8RES *v8res = (V8RES *)initid->ptr;
+  if (args->args[0] == FALSE) {
+    //script argument is not a constant.
+    v8res->compiled = 0;
+    return INIT_SUCCESS;
+  }
+
+  v8::TryCatch try_catch;
+  //script argument is a constant, compile it.
+  v8res->script = v8::Persistent<v8::Script>::New(
+    getScriptArgValue(args, 0)
+  );
+  if (v8res->script.IsEmpty()) {
+    const char *exceptionMessage = getExceptionString(&try_catch);
+    strcpy(message, MSG_SCRIPT_COMPILATION_FAILED);
+    LOG_ERR(MSG_SCRIPT_COMPILATION_FAILED);
+    LOG_ERR(exceptionMessage);
+    v8res->context->Exit();
+    return INIT_ERROR;
+  }
+  v8res->compiled = 1;
+  return INIT_SUCCESS;
+}
+
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+//the UDF init function.
+//called once by the mysql server
+//before running the udf row level function
+my_bool js_init(UDF_INIT *initid, UDF_ARGS *args, char *message){
+  if (js_check_arguments(args, message) == INIT_ERROR) return INIT_ERROR;
+  if (js_alloc_resources(initid, args, message) == INIT_ERROR) return INIT_ERROR;
+  js_set_initid_defaults(initid);
+
   //v8 introductory voodoo incantations
   v8::Locker locker;
-  v8::TryCatch try_catch;
   v8::HandleScope handle_scope;
 
   //set up a context
+  V8RES *v8res = (V8RES *)initid->ptr;
   v8res->context = v8::Context::New(NULL, getGlobalTemplate());
   if (v8res->context.IsEmpty()) {
     strcpy(message, MSG_CREATE_CONTEXT_FAILED);
@@ -688,35 +657,10 @@ my_bool js_init(
   v8res->context->Enter();
 
   //create and initialize arguments array
-  setupArguments(v8res, args);
+  if (setupArguments(v8res, args, message) == INIT_ERROR) return INIT_ERROR;
 
-  //set some properties of the return value.
-  initid->max_length = JS_MAX_RETURN_VALUE_LENGTH;
-  //script author can return what they like, including null
-  initid->maybe_null = TRUE;
-  //script author can always write a non-deterministic script
-  initid->const_item = FALSE;
+  if (js_pre_compile(initid, args, message) == INIT_ERROR) return INIT_ERROR;
 
-  //check if we can pre-compile the script
-  if (args->args[0] == FALSE) { //script argument is not a constant.
-    v8res->compiled = 0;
-  }
-  else {                    //script argument is a constant, compile it.
-    v8res->script = v8::Persistent<v8::Script>::New(
-      getScriptArgValue(args, 0)
-    );
-    if (v8res->script.IsEmpty()) {
-      const char *exceptionMessage = getExceptionString(&try_catch);
-      strcpy(message, MSG_SCRIPT_COMPILATION_FAILED);
-      LOG_ERR(MSG_SCRIPT_COMPILATION_FAILED);
-      LOG_ERR(exceptionMessage);
-      v8res->context->Exit();
-      return INIT_ERROR;
-    }
-    v8res->compiled = 1;
-  }
-
-  //
   v8res->context->Exit();
 
   return INIT_SUCCESS;
@@ -742,8 +686,6 @@ my_bool jsudf_init(
   v8res->context->Enter();
   v8::HandleScope handle_scope;
 
-  addUdfConstantsInstance(v8res->context);
-
   v8::Local<v8::Value> value = v8res->script->Run();
   if (value.IsEmpty()) {
     LOG_ERR(getExceptionString(&try_catch));
@@ -767,17 +709,20 @@ my_bool jsudf_init(
   v8res->compiled |= 2;
 
   //set UDF_INIT variables:
-  global->Set(v8::String::New("udf_init"), newUdfInit(initid));
+  add_udf_init_accessors(global->GetPrototype()->ToObject(), initid);
 
+  add_udf_constants(global);
   //setup argument objects
-  setupArgumentObjects(v8res, args);
+  if (setupArgumentObjects(v8res, args, message) == INIT_ERROR) {
+    v8res->context->Exit();
+    return INIT_ERROR;
+  }
 
   //look if there is an init function, and call it.
   member = global->Get(v8::String::New("init"));
   if (member->IsFunction()) {
     func = v8::Handle<v8::Function>::Cast(member);
-    v8::Handle<v8::Value> argv[0] = {};
-    value = func->Call(global, 0, argv);
+    value = func->Call(global, args->arg_count - 1, v8res->arg_values);
     if (value.IsEmpty()) {
       //todo: get exception message
       v8res->context->Exit();
@@ -847,18 +792,17 @@ void js_deinit(
   if (initid->ptr == NULL) return;
   //clean up v8
   V8RES *v8res = (V8RES *)initid->ptr;
-
+  if (v8res->result != NULL) free(v8res->result);
+  if (v8res->arg_extractors != NULL) free(v8res->arg_extractors);
+  if (v8res->arg_values != NULL) free(v8res->arg_values);
   //v8 introductory voodoo incantations
   v8::Locker locker;
-//  v8::TryCatch try_catch;
   if (v8res->compiled & 1) {
     v8res->script.Dispose();
   }
   v8res->arguments.Dispose();
   v8res->context.Dispose();
   v8res->context.Clear();
-  if (v8res->result != NULL) free(v8res->result);
-  free(v8res->arg_extractors);
   free(v8res);
 }
 
@@ -883,8 +827,7 @@ void jsudf_deinit(
   v8::Handle<v8::Value> member = global->Get(v8::String::New("deinit"));
   if (member->IsFunction()) {
     v8::Handle<v8::Function> func = v8::Handle<v8::Function>::Cast(member);
-    v8::Handle<v8::Value> argv[0] = {};
-    func->Call(global, 0, argv);
+    func->Call(global, 0, v8res->arg_values);
   }
   v8res->context->Exit();
   //TODO: check if a udf_deinit exists, and call it.
@@ -959,8 +902,8 @@ char *js(
   //return the value returned by the script
   v8::String::AsciiValue ascii(value);
   *length = (unsigned long)ascii.length();
-  if (alloc_result(v8res, length) == FALSE) {
-    LOG_ERR(MSG_RESOURCE_ALLOCATION_FAILED);
+  if (alloc_result(v8res, length) == INIT_ERROR) {
+    LOG_ERR(MSG_RESULT_ALLOCATION_FAILED);
     *error = TRUE;
     return NULL;
   }
@@ -1036,10 +979,72 @@ void jsagg_add(
 
   updateArgumentObjects(v8res, args);
 
-  v8::Handle<v8::Value> argv[0] = {};
-  v8res->udf->Call(v8res->context->Global(), 0, argv);
+  v8res->udf->Call(v8res->context->Global(), args->arg_count - 1, v8res->arg_values);
   v8res->context->Exit();
+}
+
+struct st_mysql_daemon js_daemon_info = {
+  MYSQL_DAEMON_INTERFACE_VERSION
+};
+
+static int js_daemon_plugin_init(MYSQL_PLUGIN){
+  LOG_ERR(MSG_JS_DAEMON_STARTUP);
+  v8::Locker locker;
+  v8::HandleScope handle_scope;
+  js_daemon_heap_statistics = createHeapStatistics();
+  jsDaemonContext = v8::Context::New();
+  jsDaemonContext->Enter();
+  globalTemplate = createGlobalTemplate();
+
+  str_STRING_RESULT = v8::Persistent<v8::String>::New(v8::String::New("STRING_RESULT"));
+  str_INT_RESULT = v8::Persistent<v8::String>::New(v8::String::New("INT_RESULT"));
+  str_DECIMAL_RESULT = v8::Persistent<v8::String>::New(v8::String::New("DECIMAL_RESULT"));
+  str_REAL_RESULT = v8::Persistent<v8::String>::New(v8::String::New("REAL_RESULT"));
+  str_ROW_RESULT = v8::Persistent<v8::String>::New(v8::String::New("ROW_RESULT"));
+  str_DECIMAL_RESULT = v8::Persistent<v8::String>::New(v8::String::New("DECIMAL_RESULT"));
+  str_NOT_FIXED_DEC = v8::Persistent<v8::String>::New(v8::String::New("NOT_FIXED_DEC"));
+
+  str_arguments = v8::Persistent<v8::String>::New(v8::String::New("arguments"));
+  str_const_item = v8::Persistent<v8::String>::New(v8::String::New("const_item"));
+  str_decimals = v8::Persistent<v8::String>::New(v8::String::New("decimals"));
+  str_maybe_null = v8::Persistent<v8::String>::New(v8::String::New("maybe_null"));
+  str_max_length = v8::Persistent<v8::String>::New(v8::String::New("max_length"));
+  str_name = v8::Persistent<v8::String>::New(v8::String::New("name"));
+  str_type = v8::Persistent<v8::String>::New(v8::String::New("type"));
+  str_value = v8::Persistent<v8::String>::New(v8::String::New("value"));
+
+  jsDaemonContext->Exit();
+  return 0;
+}
+
+static int js_daemon_plugin_deinit(MYSQL_PLUGIN){
+  v8::Locker locker;
+  v8::HandleScope handle_scope;
+  jsDaemonContext->Enter();
+  globalTemplate.Dispose();
+
+  str_STRING_RESULT.Dispose();
+  str_INT_RESULT.Dispose();
+  str_DECIMAL_RESULT.Dispose();
+  str_REAL_RESULT.Dispose();
+  str_ROW_RESULT.Dispose();
+  str_DECIMAL_RESULT.Dispose();
+  str_NOT_FIXED_DEC.Dispose();
+
+  str_arguments.Dispose();
+  str_const_item.Dispose();
+  str_decimals.Dispose();
+  str_maybe_null.Dispose();
+  str_max_length.Dispose();
+  str_name.Dispose();
+  str_type.Dispose();
+  str_value.Dispose();
+
+  jsDaemonContext->Exit();
+  jsDaemonContext.Dispose();
+  LOG_ERR(MSG_JS_DAEMON_SHUTDOWN);
   v8::V8::Dispose();
+  return 0;
 }
 
 mysql_declare_plugin(js_daemon)
