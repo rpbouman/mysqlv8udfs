@@ -2,12 +2,21 @@
 #include "string.h"
 #include "stdarg.h"
 #include "mysql.h"
+#include "plugin.h"
 #include "v8.h"
 
 #define TRUE                            1
 #define FALSE                           0
+#define STR_TRUE                        "true"
+#define STR_FALSE                       "false"
 #define JS_MAX_RETURN_VALUE_LENGTH      65535L
 unsigned long JS_INITIAL_RETURN_VALUE_LENGTH  = 255;
+
+static v8::Persistent<v8::ObjectTemplate> globalTemplate;
+static v8::Persistent<v8::ObjectTemplate> udfConstantsTemplate;
+static v8::Persistent<v8::ObjectTemplate> udfInitTemplate;
+static v8::Persistent<v8::Context> jsDaemonContext;
+static v8::HeapStatistics *js_daemon_heap_statistics;
 
 #define MSG_MISSING_SCRIPT              "Missing script argument."
 #define MSG_SCRIPT_MUST_BE_STRING       "Script argument must be a string."
@@ -20,6 +29,9 @@ unsigned long JS_INITIAL_RETURN_VALUE_LENGTH  = 255;
 #define MSG_NO_AGG_DEFINED              "Script does not define a function agg(){}."
 #define MSG_NO_CLEAR_DEFINED            "Script does not define a function clear(){}."
 #define MSG_ERR_SETTING_API_CONSTANT    "Operation not supported."
+#define MSG_UNSUPPORTED_TYPE            "You cannot set an arugment to this type."
+#define MSG_JS_DAEMON_STARTUP           "JS daemon startup."
+#define MSG_JS_DAEMON_SHUTDOWN          "JS daemon shutdown."
 
 #define LOG_ERR(a) fprintf(stderr, "\n%s", a);
 
@@ -39,183 +51,9 @@ const char* getExceptionString(v8::TryCatch* try_catch) {
 
 /**
  *
- *  Global Template
+ * Wrappin UDF ARGs
  *
  */
-v8::Handle<v8::Value> getNotFixedDecConstant(
-  v8::Local<v8::String> property,
-  const v8::AccessorInfo& info
-){
-  return v8::Uint32::New(NOT_FIXED_DEC);
-}
-
-void setConstant(
-  v8::Local<v8::String> property,
-  v8::Local<v8::Value> value,
-  const v8::AccessorInfo& info
-){
-  v8::ThrowException(
-    v8::Exception::Error(
-      v8::String::New(MSG_ERR_SETTING_API_CONSTANT)
-    )
-  );
-}
-
-v8::Persistent<v8::ObjectTemplate> createGlobalTemplate(){
-  v8::Handle<v8::ObjectTemplate> globalTemplate = v8::ObjectTemplate::New();
-  //precision used for values that don't have fixed number of decimals.
-  globalTemplate->SetAccessor(v8::String::New("NOT_FIXED_DEC"), getNotFixedDecConstant, setConstant);
-  return v8::Persistent<v8::ObjectTemplate>::New(globalTemplate);
-}
-
-//create a global object template used to initialize
-//the scripts' global execution environment.
-v8::Handle<v8::ObjectTemplate> getGlobalTemplate(){
-  //static ensures we will only create the template once.
-  //TODO: create a daemon plugin that manages shared global resources
-  static v8::Persistent<v8::ObjectTemplate> globalTemplate = createGlobalTemplate();
-  return globalTemplate;
-}
-
-/**
- *
- *  Wrapping Item_result
- *
- */
-v8::Handle<v8::Value> getStringResultConstant(
-  v8::Local<v8::String> property,
-  const v8::AccessorInfo& info
-){
-  return v8::Uint32::New(STRING_RESULT);
-}
-
-v8::Handle<v8::Value> getRealResultConstant(
-  v8::Local<v8::String> property,
-  const v8::AccessorInfo& info
-){
-  return v8::Uint32::New(REAL_RESULT);
-}
-
-v8::Handle<v8::Value> getIntResultConstant(
-  v8::Local<v8::String> property,
-  const v8::AccessorInfo& info
-){
-  return v8::Uint32::New(INT_RESULT);
-}
-
-v8::Handle<v8::Value> getRowResultConstant(
-  v8::Local<v8::String> property,
-  const v8::AccessorInfo& info
-){
-  return v8::Uint32::New(ROW_RESULT);
-}
-
-v8::Handle<v8::Value> getDecimalResultConstant(
-  v8::Local<v8::String> property,
-  const v8::AccessorInfo& info
-){
-  return v8::Uint32::New(DECIMAL_RESULT);
-}
-
-v8::Persistent<v8::ObjectTemplate> createItemResultTemplate(){
-  v8::Handle<v8::ObjectTemplate> itemResultTemplate = v8::ObjectTemplate::New();
-
-  //add the result constants (useful if user wants to change the argument types)
-  itemResultTemplate->SetAccessor(v8::String::New("STRING_RESULT"), getStringResultConstant, setConstant);
-  itemResultTemplate->SetAccessor(v8::String::New("REAL_RESULT"), getRealResultConstant, setConstant);
-  itemResultTemplate->SetAccessor(v8::String::New("INT_RESULT"), getIntResultConstant, setConstant);
-  itemResultTemplate->SetAccessor(v8::String::New("ROW_RESULT"), getRowResultConstant, setConstant);
-  itemResultTemplate->SetAccessor(v8::String::New("DECIMAL_RESULT"), getDecimalResultConstant, setConstant);
-
-  //precision used for values that don't have fixed number of decimals.
-  itemResultTemplate->SetAccessor(v8::String::New("NOT_FIXED_DEC"), getNotFixedDecConstant, setConstant);
-  return v8::Persistent<v8::ObjectTemplate>::New(itemResultTemplate);
-}
-
-v8::Handle<v8::ObjectTemplate> getItemResultTemplate(){
-  //static ensures we will only create the template once.
-  //TODO: create a daemon plugin that manages shared global resources
-  static v8::Persistent<v8::ObjectTemplate> itemResultTemplate = createItemResultTemplate();
-  return itemResultTemplate;
-}
-
-v8::Handle<v8::Object> getItemResultInstance(){
-  return getItemResultTemplate()->NewInstance();
-}
-
-void addItemResultInstance(v8::Persistent<v8::Context> context){
-  context->Global()->Set(v8::String::New("Item_result"), getItemResultInstance());
-}
-
-/**
- *
- *  Wrapping UDF_INIT
- *
- */
-v8::Handle<v8::Value> get_const_item(v8::Local<v8::String> property, const v8::AccessorInfo &info){
-  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
-  return initid->const_item ? v8::True() : v8::False();
-}
-
-void set_const_item(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
-  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
-  initid->const_item = value->BooleanValue() ? 1 : 0;
-}
-
-v8::Handle<v8::Value> get_decimals(v8::Local<v8::String> property, const v8::AccessorInfo &info){
-  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
-  return v8::Uint32::New(initid->decimals);
-}
-
-void set_decimals(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
-  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
-  initid->decimals = value->Uint32Value();
-}
-
-v8::Handle<v8::Value> get_max_length(v8::Local<v8::String> property, const v8::AccessorInfo &info){
-  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
-  return v8::Integer::New(initid->max_length);
-}
-
-void set_max_length(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
-  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
-  initid->max_length = value->IntegerValue();
-}
-
-v8::Handle<v8::Value> get_maybe_null(v8::Local<v8::String> property, const v8::AccessorInfo &info){
-  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
-  return initid->maybe_null ? v8::True() : v8::False();
-}
-
-void set_maybe_null(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
-  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
-  initid->maybe_null = value->BooleanValue() ? 1 : 0;
-}
-
-v8::Persistent<v8::ObjectTemplate> createUdfInitTemplate() {
-  v8::Handle<v8::ObjectTemplate> udfInitTemplate = v8::ObjectTemplate::New();
-  udfInitTemplate->SetInternalFieldCount(1);
-  udfInitTemplate->SetAccessor(v8::String::New("const_item"), get_const_item, set_const_item);
-  udfInitTemplate->SetAccessor(v8::String::New("decimals"), get_decimals, set_decimals);
-  udfInitTemplate->SetAccessor(v8::String::New("max_length"), get_max_length, set_max_length);
-  udfInitTemplate->SetAccessor(v8::String::New("maybe_null"), get_maybe_null, set_maybe_null);
-  return v8::Persistent<v8::ObjectTemplate>::New(udfInitTemplate);
-}
-
-v8::Handle<v8::ObjectTemplate> getUdfInitTemplate(){
-  //static ensures we will only create the template once.
-  //TODO: create a daemon plugin that manages shared global resources
-  static v8::Persistent<v8::ObjectTemplate> udfInitTemplate = createUdfInitTemplate();
-  return udfInitTemplate;
-}
-
-v8::Local<v8::Object> newUdfInit(UDF_INIT* initid) {
-  v8::Local<v8::Object> _initid = getUdfInitTemplate()->NewInstance();
-  _initid->SetInternalField(0, v8::External::New(initid));
-  return _initid;
-}
-
-//ARG_EXTRACTOR = pointer to an extractor function
 typedef v8::Handle<v8::Value> (*ARG_EXTRACTOR)(UDF_ARGS*, unsigned int);
 
 //extractor to get a STRING udf argument as a javascript string.
@@ -262,7 +100,6 @@ typedef struct st_v8_resources {
   unsigned long max_result_length;      //number of bytes allocated for the result buffer.
 } V8RES;
 
-
 //set up arguments.
 //Any arguments beyond the initial "script" argument
 //are available in a global array called arguments
@@ -278,15 +115,26 @@ void setupArguments(V8RES *v8res, UDF_ARGS* args) {
     //for each argument, find a suitable extractor.
     //(the extractor translates value from mysql to v8 land)
     ARG_EXTRACTOR arg_extractor;
+    my_bool was_decimal = FALSE;
     switch (args->arg_type[i]) {
-      case DECIMAL_RESULT:
       case ROW_RESULT:
+        args->arg_type[i] = STRING_RESULT;
       case STRING_RESULT:
         arg_extractor = getStringArgValue;
         break;
       case INT_RESULT:
         arg_extractor = getIntArgValue;
         break;
+      case DECIMAL_RESULT:
+        //explicitly coerce decimals into reals.
+        //we don't really like to do this but since MySQL doesn't offer
+        //a CAST from decimal to real we do it automatically.
+        //users that want to apply true decimal semantics to their decimal
+        //values should CAST their decimal values to strings instead and
+        //handle the string to decimal conversion inside the script themselves.
+        args->arg_type[i] = REAL_RESULT;
+        //mark as was decimal in case we need to get the value.
+        was_decimal = TRUE;
       case REAL_RESULT:
         arg_extractor = getRealArgValue;
         break;
@@ -299,7 +147,16 @@ void setupArguments(V8RES *v8res, UDF_ARGS* args) {
     else {
       //this is a constant argument.
       //call the extractor only once here to obtain its value
-      v8res->arguments->Set(i - 1, (*arg_extractor)(args, i));
+      if (was_decimal) {
+        //if it was DECIMAL, we coerce it to REAL.
+        //but in this phase, the coercion has not taken place yet,
+        //so if we need the value (as is the case now)
+        //we need to use the old string extractor
+        v8res->arguments->Set(i - 1, getStringArgValue(args, i)->ToNumber());
+      }
+      else {
+        v8res->arguments->Set(i - 1, (*arg_extractor)(args, i));
+      }
       v8res->arg_extractors[i] = NULL;
     }
   }
@@ -313,10 +170,13 @@ v8::Local<v8::Object> createArgumentObject(V8RES *v8res, UDF_ARGS *args, unsigne
   ARG_EXTRACTOR arg_extractor = v8res->arg_extractors[i];
   if (arg_extractor == NULL) {
     argumentObject->Set(v8::String::New("value"), v8res->arguments->Get(i - 1));
+    argumentObject->Set(v8::String::New("const_item"), v8::True());
   }
   else {
     argumentObject->Set(v8::String::New("value"), v8::Null());
+    argumentObject->Set(v8::String::New("const_item"), v8::False());
   }
+
   argumentObject->Set(v8::String::New("maybe_null"), args->maybe_null[i] == TRUE ? v8::True() : v8::False());
   return argumentObject;
 }
@@ -344,17 +204,41 @@ void updateArgumentObjects(V8RES *v8res, UDF_ARGS* args){
   }
 }
 
-//
-void updateArgsFromArgumentObjects(V8RES *v8res, UDF_ARGS *args){
-  v8::Local<v8::String> typekey = v8::String::New("type");
+//this is called in the init after running the js init.
+//this reads back the type field of the argument objects
+my_bool updateArgsFromArgumentObjects(V8RES *v8res, UDF_ARGS *args){
+  v8::Local<v8::String> typeKey = v8::String::New("type");
+  v8::Local<v8::String> valueKey = v8::String::New("value");
   v8::Local<v8::Value> type;
   v8::Local<v8::Uint32> intType;
+  v8::Local<v8::Object> argument;
+  Item_result _type;
   for (unsigned int i = 1; i < args->arg_count; i++) {
-    type = v8res->arguments->Get(i - 1)->ToObject()->Get(typekey);
-    if (type->IsUint32()) {
-      intType = type->ToUint32();
+    argument = v8res->arguments->Get(i - 1)->ToObject();
+    _type = (Item_result)argument->Get(typeKey)->ToUint32()->Value();
+    if (_type == args->arg_type[i]) continue;
+    switch (_type) {
+      case STRING_RESULT:
+        args->arg_type[i] = _type;
+        if (args->args[i] != NULL) {
+          argument->Set(valueKey, argument->Get(valueKey)->ToString());
+        }
+        break;
+      case REAL_RESULT:
+      case INT_RESULT:
+        args->arg_type[i] = _type;
+        if (args->args[i] != NULL) {
+          argument->Set(valueKey, argument->Get(valueKey)->ToNumber());
+        }
+        break;
+      case DECIMAL_RESULT:
+      case ROW_RESULT:
+      default:
+        return INIT_ERROR;
+        break;
     }
   }
+  return INIT_SUCCESS;
 }
 
 //assign udf argument values to javascript arguments array.
@@ -461,6 +345,297 @@ char* call_udf_return_func(
   return v8res->result;
 }
 
+/**
+ *  js daemon plugin
+ */
+v8::Persistent<v8::ObjectTemplate> createGlobalTemplate(){
+  v8::Handle<v8::ObjectTemplate> _template = v8::ObjectTemplate::New();
+  //precision used for values that don't have fixed number of decimals.
+  return v8::Persistent<v8::ObjectTemplate>::New(_template);
+}
+
+//create a global object template used to initialize
+//the scripts' global execution environment.
+v8::Handle<v8::ObjectTemplate> getGlobalTemplate(){
+  //static ensures we will only create the template once.
+  //TODO: create a daemon plugin that manages shared global resources
+//  static v8::Persistent<v8::ObjectTemplate> globalTemplate = createGlobalTemplate();
+  return globalTemplate;
+}
+
+/**
+ *
+ *  Wrapping useful udf constants
+ *
+ */
+void setConstant(
+  v8::Local<v8::String> property,
+  v8::Local<v8::Value> value,
+  const v8::AccessorInfo& info
+){
+  v8::ThrowException(
+    v8::Exception::Error(
+      v8::String::New(MSG_ERR_SETTING_API_CONSTANT)
+    )
+  );
+}
+
+v8::Handle<v8::Value> getStringResultConstant(
+  v8::Local<v8::String> property,
+  const v8::AccessorInfo& info
+){
+  return v8::Uint32::New(STRING_RESULT);
+}
+
+v8::Handle<v8::Value> getRealResultConstant(
+  v8::Local<v8::String> property,
+  const v8::AccessorInfo& info
+){
+  return v8::Uint32::New(REAL_RESULT);
+}
+
+v8::Handle<v8::Value> getIntResultConstant(
+  v8::Local<v8::String> property,
+  const v8::AccessorInfo& info
+){
+  return v8::Uint32::New(INT_RESULT);
+}
+
+v8::Handle<v8::Value> getRowResultConstant(
+  v8::Local<v8::String> property,
+  const v8::AccessorInfo& info
+){
+  return v8::Uint32::New(ROW_RESULT);
+}
+
+v8::Handle<v8::Value> getDecimalResultConstant(
+  v8::Local<v8::String> property,
+  const v8::AccessorInfo& info
+){
+  return v8::Uint32::New(DECIMAL_RESULT);
+}
+
+v8::Handle<v8::Value> getNotFixedDecConstant(
+  v8::Local<v8::String> property,
+  const v8::AccessorInfo& info
+){
+  return v8::Uint32::New(NOT_FIXED_DEC);
+}
+
+v8::Persistent<v8::ObjectTemplate> createUdfConstantsTemplate(){
+  v8::Handle<v8::ObjectTemplate> udfConstantsTemplate = v8::ObjectTemplate::New();
+
+  //add the result constants (useful if user wants to change the argument types)
+  udfConstantsTemplate->SetAccessor(v8::String::New("STRING_RESULT"), getStringResultConstant, setConstant);
+  udfConstantsTemplate->SetAccessor(v8::String::New("REAL_RESULT"), getRealResultConstant, setConstant);
+  udfConstantsTemplate->SetAccessor(v8::String::New("INT_RESULT"), getIntResultConstant, setConstant);
+  udfConstantsTemplate->SetAccessor(v8::String::New("ROW_RESULT"), getRowResultConstant, setConstant);
+  udfConstantsTemplate->SetAccessor(v8::String::New("DECIMAL_RESULT"), getDecimalResultConstant, setConstant);
+  udfConstantsTemplate->SetAccessor(v8::String::New("NOT_FIXED_DEC"), getNotFixedDecConstant, setConstant);
+
+  return v8::Persistent<v8::ObjectTemplate>::New(udfConstantsTemplate);
+}
+
+v8::Handle<v8::ObjectTemplate> getUdfConstantsTemplate(){
+  //static ensures we will only create the template once.
+  //TODO: create a daemon plugin that manages shared global resources
+  return udfConstantsTemplate;
+}
+
+v8::Handle<v8::Object> getUdfConstantsInstance(){
+  return getUdfConstantsTemplate()->NewInstance();
+}
+
+void addUdfConstantsInstance(v8::Persistent<v8::Context> context){
+  context->Global()->Set(v8::String::New("udf_constants"), getUdfConstantsInstance());
+}
+
+/**
+ *
+ *  Wrapping UDF_INIT
+ *
+ */
+v8::Handle<v8::Value> get_const_item(v8::Local<v8::String> property, const v8::AccessorInfo &info){
+  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
+  return initid->const_item ? v8::True() : v8::False();
+}
+
+void set_const_item(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
+  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
+  initid->const_item = value->BooleanValue() ? 1 : 0;
+}
+
+v8::Handle<v8::Value> get_decimals(v8::Local<v8::String> property, const v8::AccessorInfo &info){
+  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
+  return v8::Uint32::New(initid->decimals);
+}
+
+void set_decimals(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
+  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
+  initid->decimals = value->Uint32Value();
+}
+
+v8::Handle<v8::Value> get_max_length(v8::Local<v8::String> property, const v8::AccessorInfo &info){
+  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
+  return v8::Integer::New(initid->max_length);
+}
+
+void set_max_length(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
+  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
+  initid->max_length = value->IntegerValue();
+}
+
+v8::Handle<v8::Value> get_maybe_null(v8::Local<v8::String> property, const v8::AccessorInfo &info){
+  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
+  return initid->maybe_null ? v8::True() : v8::False();
+}
+
+void set_maybe_null(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
+  UDF_INIT* initid = (UDF_INIT*)v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0))->Value();
+  initid->maybe_null = value->BooleanValue() ? 1 : 0;
+}
+
+v8::Persistent<v8::ObjectTemplate> createUdfInitTemplate() {
+  v8::Handle<v8::ObjectTemplate> udfInitTemplate = v8::ObjectTemplate::New();
+  udfInitTemplate->SetInternalFieldCount(1);
+  udfInitTemplate->SetAccessor(v8::String::New("const_item"), get_const_item, set_const_item);
+  udfInitTemplate->SetAccessor(v8::String::New("decimals"), get_decimals, set_decimals);
+  udfInitTemplate->SetAccessor(v8::String::New("max_length"), get_max_length, set_max_length);
+  udfInitTemplate->SetAccessor(v8::String::New("maybe_null"), get_maybe_null, set_maybe_null);
+  return v8::Persistent<v8::ObjectTemplate>::New(udfInitTemplate);
+}
+
+v8::Handle<v8::ObjectTemplate> getUdfInitTemplate(){
+  //static ensures we will only create the template once.
+  //TODO: create a daemon plugin that manages shared global resources
+  return udfInitTemplate;
+}
+
+v8::Local<v8::Object> newUdfInit(UDF_INIT* initid) {
+  v8::Local<v8::Object> _initid = getUdfInitTemplate()->NewInstance();
+  _initid->SetInternalField(0, v8::External::New(initid));
+  return _initid;
+}
+
+/**
+ *  js_daemon plugin
+ */
+v8::HeapStatistics *createHeapStatistics(){
+  v8::HeapStatistics *heapStatistics = new v8::HeapStatistics();
+  return heapStatistics;
+}
+
+struct st_mysql_daemon js_daemon_info = {
+  MYSQL_DAEMON_INTERFACE_VERSION
+};
+
+static int js_daemon_plugin_init(MYSQL_PLUGIN){
+  LOG_ERR(MSG_JS_DAEMON_STARTUP);
+  v8::Locker locker;
+  v8::HandleScope handle_scope;
+  js_daemon_heap_statistics = createHeapStatistics();
+  jsDaemonContext = v8::Context::New();
+  jsDaemonContext->Enter();
+  globalTemplate = createGlobalTemplate();
+  udfConstantsTemplate = createUdfConstantsTemplate();
+  udfInitTemplate = createUdfInitTemplate();
+  jsDaemonContext->Exit();
+  return 0;
+}
+
+static int js_daemon_plugin_deinit(MYSQL_PLUGIN){
+  v8::Locker locker;
+  v8::HandleScope handle_scope;
+  jsDaemonContext->Enter();
+  globalTemplate.Dispose();
+  udfConstantsTemplate.Dispose();
+  udfInitTemplate.Dispose();
+  jsDaemonContext->Exit();
+  jsDaemonContext.Dispose();
+  LOG_ERR(MSG_JS_DAEMON_SHUTDOWN);
+  return 0;
+}
+
+void updateHeapStatistics(){
+  v8::Locker locker;
+  v8::V8::GetHeapStatistics(js_daemon_heap_statistics);
+}
+
+int status_var_v8_heap_size_limit(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_INT;
+  updateHeapStatistics();
+  *buff = (int)js_daemon_heap_statistics->heap_size_limit();
+  var->value = buff;
+  return 0;
+}
+
+int status_var_v8_heap_size_total(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_INT;
+  updateHeapStatistics();
+  *buff = (int)js_daemon_heap_statistics->total_heap_size();
+  var->value = buff;
+  return 0;
+}
+
+int status_var_v8_heap_size_total_executable(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_INT;
+  updateHeapStatistics();
+  *buff = (int)js_daemon_heap_statistics->total_heap_size();
+  var->value = buff;
+  return 0;
+}
+
+int status_var_v8_heap_size_used(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_INT;
+  updateHeapStatistics();
+  *buff = (int)js_daemon_heap_statistics->used_heap_size();
+  var->value = buff;
+  return 0;
+}
+
+int status_var_v8_is_dead(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_CHAR;
+  sprintf(buff, "%s", v8::V8::IsDead() ? STR_TRUE : STR_FALSE);
+  var->value = buff;
+  return 0;
+}
+
+int status_var_v8_is_execution_terminating(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_CHAR;
+  sprintf(buff, "%s", v8::V8::IsExecutionTerminating() ? STR_TRUE : STR_FALSE);
+  var->value = buff;
+  return 0;
+}
+
+int status_var_v8_is_profiler_paused(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_CHAR;
+  sprintf(buff, "%s", v8::V8::IsProfilerPaused() ? STR_TRUE : STR_FALSE);
+  var->value = buff;
+  return 0;
+}
+
+int status_var_v8_version(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_CHAR;
+  var->value = (char *)v8::V8::GetVersion();
+  return 0;
+}
+
+struct st_mysql_show_var js_daemon_status_vars[] =
+{
+  {"js_v8_heap_size_limit", (char *)&status_var_v8_heap_size_limit, SHOW_FUNC},
+  {"js_v8_heap_size_total", (char *)&status_var_v8_heap_size_total, SHOW_FUNC},
+  {"js_v8_heap_size_total_executable", (char *)&status_var_v8_heap_size_total_executable, SHOW_FUNC},
+  {"js_v8_heap_size_used", (char *)&status_var_v8_heap_size_used, SHOW_FUNC},
+  {"js_v8_is_dead", (char *)&status_var_v8_is_dead, SHOW_FUNC},
+  {"js_v8_is_execution_terminating", (char *)&status_var_v8_is_execution_terminating, SHOW_FUNC},
+  {"js_v8_is_profiler_paused", (char *)&status_var_v8_is_profiler_paused, SHOW_FUNC},
+  {"js_v8_version", (char *)&status_var_v8_version, SHOW_FUNC},
+  {0, 0, SHOW_UNDEF}
+};
+
+static struct st_mysql_sys_var *js_daemon_system_vars[]= {
+  NULL
+};
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -511,7 +686,6 @@ my_bool js_init(
     return INIT_ERROR;
   }
   v8res->context->Enter();
-  addItemResultInstance(v8res->context);
 
   //create and initialize arguments array
   setupArguments(v8res, args);
@@ -566,8 +740,9 @@ my_bool jsudf_init(
   v8::TryCatch try_catch;
 
   v8res->context->Enter();
-  //v8::Context::Scope context_scope(v8res->context);
   v8::HandleScope handle_scope;
+
+  addUdfConstantsInstance(v8res->context);
 
   v8::Local<v8::Value> value = v8res->script->Run();
   if (value.IsEmpty()) {
@@ -592,7 +767,7 @@ my_bool jsudf_init(
   v8res->compiled |= 2;
 
   //set UDF_INIT variables:
-  global->Set(v8::String::New("UDF_INIT"), newUdfInit(initid));
+  global->Set(v8::String::New("udf_init"), newUdfInit(initid));
 
   //setup argument objects
   setupArgumentObjects(v8res, args);
@@ -609,9 +784,12 @@ my_bool jsudf_init(
       return INIT_ERROR;
     }
     //
-    updateArgsFromArgumentObjects(v8res, args);
   }
-
+  if (updateArgsFromArgumentObjects(v8res, args) == INIT_ERROR) {
+    strcpy(message, MSG_UNSUPPORTED_TYPE);
+    v8res->context->Exit();
+    return INIT_ERROR;
+  }
   v8res->context->Exit();
   return INIT_SUCCESS;
 }
@@ -861,7 +1039,25 @@ void jsagg_add(
   v8::Handle<v8::Value> argv[0] = {};
   v8res->udf->Call(v8res->context->Global(), 0, argv);
   v8res->context->Exit();
+  v8::V8::Dispose();
 }
+
+mysql_declare_plugin(js_daemon)
+{
+  MYSQL_DAEMON_PLUGIN,
+  &js_daemon_info,
+  "js_daemon",
+  "Roland Bouman",
+  "Javascript Daemon",
+  PLUGIN_LICENSE_GPL,
+  js_daemon_plugin_init, /* Plugin Init */
+  js_daemon_plugin_deinit, /* Plugin Deinit */
+  0x0100 /* 1.0 */,
+  js_daemon_status_vars,      /* status variables                */
+  js_daemon_system_vars,      /* system variables                */
+  NULL                        /* config options                  */
+}
+mysql_declare_plugin_end;
 
 #ifdef __cplusplus
 };
