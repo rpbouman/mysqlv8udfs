@@ -1,6 +1,7 @@
 #include "stdlib.h"
 #include "string.h"
 #include "stdarg.h"
+#include "dirent.h"
 #include "mysql.h"
 #include "plugin.h"
 #include "v8.h"
@@ -10,25 +11,16 @@
 #define STR_TRUE                        "true"
 #define STR_FALSE                       "false"
 #define JS_MAX_RETURN_VALUE_LENGTH      65535L
-unsigned long JS_INITIAL_RETURN_VALUE_LENGTH  = 255;
+#define UDF_MAX_ERROR_MSG_LENGTH        255
 
-static v8::Persistent<v8::ObjectTemplate> globalTemplate;
-static v8::Persistent<v8::String> str_arguments;
-static v8::Persistent<v8::String> str_const_item;
-static v8::Persistent<v8::String> str_decimals;
-static v8::Persistent<v8::String> str_maybe_null;
-static v8::Persistent<v8::String> str_max_length;
-static v8::Persistent<v8::String> str_name;
-static v8::Persistent<v8::String> str_type;
-static v8::Persistent<v8::String> str_value;
-static v8::Persistent<v8::String> str_STRING_RESULT;
-static v8::Persistent<v8::String> str_INT_RESULT;
-static v8::Persistent<v8::String> str_DECIMAL_RESULT;
-static v8::Persistent<v8::String> str_REAL_RESULT;
-static v8::Persistent<v8::String> str_ROW_RESULT;
-static v8::Persistent<v8::String> str_NOT_FIXED_DEC;
-static v8::Persistent<v8::Context> jsDaemonContext;
-static v8::HeapStatistics *js_daemon_heap_statistics;
+//values for the v8res->compiled bitfield
+#define COMPILED_NO                     0
+#define COMPILED_YES                    1
+#define COMPILED_UDF                    2
+#define COMPILED_CLEAR                  4
+#define COMPILED_AGG                    8
+
+unsigned long JS_INITIAL_RETURN_VALUE_LENGTH  = 255;
 
 #define MSG_MISSING_SCRIPT              "Missing script argument."
 #define MSG_SCRIPT_MUST_BE_STRING       "Script argument must be a string."
@@ -43,25 +35,76 @@ static v8::HeapStatistics *js_daemon_heap_statistics;
 #define MSG_NO_CLEAR_DEFINED            "Script does not define a function clear(){}."
 #define MSG_ERR_SETTING_API_CONSTANT    "Operation not supported."
 #define MSG_UNSUPPORTED_TYPE            "You cannot set an arugment to this type."
-#define MSG_JS_DAEMON_STARTUP           "JS daemon startup."
+#define MSG_JS_DAEMON_STARTUP           "JS daemon starting..."
+#define MSG_JS_DAEMON_STARTED           "JS daemon started."
+#define MSG_JS_DAEMON_SHUTTING_DOWN     "JS daemon shutting down."
 #define MSG_JS_DAEMON_SHUTDOWN          "JS daemon shutdown."
+#define MSG_OK                          "Ok."
 
 #define LOG_ERR(a) fprintf(stderr, "\n%s", a);
 
 #define INIT_ERROR                      1
 #define INIT_SUCCESS                    0
 
+
+static v8::Persistent<v8::ObjectTemplate> globalTemplate;
+static v8::Persistent<v8::ObjectTemplate> mysqlTemplate;
+static v8::Persistent<v8::ObjectTemplate> mysqlClientTemplate;
+static v8::Persistent<v8::ObjectTemplate> mysqlConnectionTemplate;
+static v8::Persistent<v8::ObjectTemplate> mysqlQueryTemplate;
+static v8::Persistent<v8::ObjectTemplate> mysqlQueryResultTemplate;
+static v8::Persistent<v8::ObjectTemplate> mysqlExceptionTemplate;
+
+static v8::Persistent<v8::String> str_arguments;
+static v8::Persistent<v8::String> str_const_item;
+static v8::Persistent<v8::String> str_decimals;
+static v8::Persistent<v8::String> str_maybe_null;
+static v8::Persistent<v8::String> str_max_length;
+static v8::Persistent<v8::String> str_name;
+static v8::Persistent<v8::String> str_type;
+static v8::Persistent<v8::String> str_value;
+static v8::Persistent<v8::String> str_STRING_RESULT;
+static v8::Persistent<v8::String> str_INT_RESULT;
+static v8::Persistent<v8::String> str_DECIMAL_RESULT;
+static v8::Persistent<v8::String> str_REAL_RESULT;
+static v8::Persistent<v8::String> str_ROW_RESULT;
+static v8::Persistent<v8::String> str_NOT_FIXED_DEC;
+
+static v8::Persistent<v8::String> str_host;
+static v8::Persistent<v8::String> str_user;
+static v8::Persistent<v8::String> str_password;
+static v8::Persistent<v8::String> str_socket;
+static v8::Persistent<v8::String> str_schema;
+static v8::Persistent<v8::String> str_port;
+static v8::Persistent<v8::String> str_flags;
+
+static v8::Persistent<v8::String> str_code;
+static v8::Persistent<v8::String> str_message;
+static v8::Persistent<v8::String> str_sqlstate;
+
+static v8::Persistent<v8::String> str_CONNECTION_ALREADY_CLOSED;
+
+static v8::Persistent<v8::Context> jsDaemonContext;
+static v8::HeapStatistics *js_daemon_heap_statistics;
+
 const char* ToCString(const v8::String::Utf8Value& value) {
   return *value ? *value : "<string conversion failed>";
 }
 
-//get the exception string from javascript try/catch block.
-const char* getExceptionString(v8::TryCatch* try_catch) {
-  v8::String::Utf8Value exception(try_catch->Exception());
-  const char* exception_string = ToCString(exception);
-  return exception_string;
+//this is useful to clean up any disposed handles before automatic GC
+//if your objects only use memory, let GC handle it.
+//but if you have weak persistent handles that connect to real resources
+//like database connections, files, sockets etc.
+//then those won't be cleaned up immediately after the handle is disposed.
+//generally you want to clean those resources up, so you should call this
+//to do that.
+void force_v8_cleanup(){
+  while(!v8::V8::IdleNotification()) {};
 }
 
+void setConstant(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
+  v8::ThrowException(v8::Exception::Error(v8::String::New(MSG_ERR_SETTING_API_CONSTANT)));
+}
 /**
  *
  * Wrappin UDF ARGs
@@ -178,6 +221,7 @@ my_bool setupArguments(V8RES *v8res, UDF_ARGS* args, char *message) {
   return INIT_SUCCESS;
 }
 
+//create an argument object. This creates a js object for an entry in args
 v8::Local<v8::Object> createArgumentObject(V8RES *v8res, UDF_ARGS *args, unsigned int i){
   v8::Local<v8::Object> argumentObject = v8::Object::New();
   argumentObject->Set(str_name, v8::String::New(args->attributes[i], args->attribute_lengths[i]));
@@ -200,6 +244,7 @@ v8::Local<v8::Object> createArgumentObject(V8RES *v8res, UDF_ARGS *args, unsigne
   return argumentObject;
 }
 
+//expose UDF_ARGS as javascript objects. used by jsudf and jsarg
 my_bool setupArgumentObjects(V8RES *v8res, UDF_ARGS* args, char *message){
   //allocate room for value array
   v8res->arg_values = (v8::Handle<v8::Value> *)malloc((args->arg_count - 1) * sizeof(v8::Handle<v8::Value>));
@@ -213,6 +258,8 @@ my_bool setupArgumentObjects(V8RES *v8res, UDF_ARGS* args, char *message){
   return INIT_SUCCESS;
 }
 
+//update the value member of the argument objects.
+//this is called in each run of add and the row-level function.
 void updateArgumentObjects(V8RES *v8res, UDF_ARGS* args){
   ARG_EXTRACTOR arg_extractor;
   v8::Handle<v8::Value> val;
@@ -312,6 +359,8 @@ v8::Handle<v8::Script> getScriptArgValue(UDF_ARGS *args, unsigned int i){
   return v8::Script::Compile(getStringArgString(args, i));
 }
 
+//calls the passed func, and returns its value to mysql./
+//this is used to call the udf function for jsudf and the agg function for jsagg.
 char* call_udf_return_func(
   v8::Persistent<v8::Function> func,
   UDF_INIT *initid,
@@ -335,7 +384,7 @@ char* call_udf_return_func(
   if (value.IsEmpty()) {
     //error calling function
     LOG_ERR(MSG_RUNTIME_SCRIPT_ERROR);
-    LOG_ERR(getExceptionString(&try_catch));
+    LOG_ERR(*v8::String::AsciiValue(try_catch.Exception()));
     v8res->context->Exit();
     *error = TRUE;
     return NULL;
@@ -359,21 +408,705 @@ char* call_udf_return_func(
 }
 
 /**
- *  js daemon plugin
+ *
+ * MySQL bindings
+ *
+ */
+MYSQL *getMySQLConnectionInternal(v8::Local<v8::Object> holder, my_bool throwIfNull = TRUE) {
+  MYSQL *mysql = (MYSQL *)v8::Local<v8::External>::Cast(holder->GetInternalField(0))->Value();
+  if (mysql == NULL) v8::ThrowException(v8::Exception::Error(str_CONNECTION_ALREADY_CLOSED));
+  return mysql;
+}
+
+void weakMysqlConnectionCallback(v8::Persistent<v8::Value> object, void* _mysql) {
+  LOG_ERR("Cleaning up weak mysql client...");
+  //TODO: clean up the connection.
+  MYSQL *mysql = (MYSQL *)_mysql;
+  if (mysql != NULL) {
+    mysql_close(mysql);
+  }
+  object.Dispose();
+}
+
+
+/**
+ *  MySQL bindings: Exception
+ *
+ */
+v8::Persistent<v8::ObjectTemplate> createMysqlExceptionTemplate(){
+  v8::Handle<v8::ObjectTemplate> _mysqlExceptionTemplate = v8::ObjectTemplate::New();
+  return v8::Persistent<v8::ObjectTemplate>::New(_mysqlExceptionTemplate);
+}
+
+void throwMysqlException(int errno, const char* msg, const char* state){
+  v8::Local<v8::Object> exception = mysqlExceptionTemplate->NewInstance();
+  exception->Set(str_code, v8::Uint32::New(errno));
+  exception->Set(str_message, v8::String::New(msg));
+  exception->Set(str_sqlstate, v8::String::New(state));
+  v8::ThrowException(exception);
+}
+
+void throwMysqlClientException(v8::Local<v8::Object> object){
+  MYSQL *mysql = getMySQLConnectionInternal(object);
+  throwMysqlException(
+    mysql_errno(mysql),
+    mysql_error(mysql),
+    mysql_sqlstate(mysql)
+  );
+}
+
+MYSQL_STMT* mysqlQueryInternalMysqlStmtGetter(v8::Handle<v8::Object> mysqlQuery);
+void throwMysqlStmtException(v8::Local<v8::Object> mysqlQuery){
+  MYSQL_STMT *mysql_stmt = mysqlQueryInternalMysqlStmtGetter(mysqlQuery);
+  throwMysqlException(
+    mysql_stmt_errno(mysql_stmt),
+    mysql_stmt_error(mysql_stmt),
+    mysql_stmt_sqlstate(mysql_stmt)
+  );
+}
+/**
+ *
+ *  MySQL bindings Result
+ *
+ */
+
+v8::Handle<v8::Value> msyqlQueryResultInternalDoneGetter(v8::Handle<v8::Object> mysqlQueryResult){
+  return mysqlQueryResult->GetInternalField(1);
+}
+
+void msyqlQueryResultInternalDoneSetter(v8::Handle<v8::Object> mysqlQueryResult, my_bool value){
+  return mysqlQueryResult->SetInternalField(1, value ? v8::True() : v8::False());
+}
+
+v8::Handle<v8::Value> mysqlQueryResultDoneGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info) {
+  return msyqlQueryResultInternalDoneGetter(info.Holder());
+}
+
+v8::Handle<v8::Value> msyqlQueryResultInternalBufferedGetter(v8::Handle<v8::Object> mysqlQueryResult){
+  return mysqlQueryResult->GetInternalField(2);
+}
+void msyqlQueryResultInternalBufferedSetter(v8::Handle<v8::Object> mysqlQueryResult, my_bool value){
+  return mysqlQueryResult->SetInternalField(2, value ? v8::True() : v8::False());
+}
+
+v8::Handle<v8::Value> mysqlQueryResultBufferedGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info) {
+  return msyqlQueryResultInternalBufferedGetter(info.Holder());
+}
+
+MYSQL_RES* mysqlQueryResultInternalMysqlResGetter(v8::Handle<v8::Object> mysqlQueryResult){
+  return (MYSQL_RES *)v8::Local<v8::External>::Cast(mysqlQueryResult->GetInternalField(0))->Value();
+}
+
+MYSQL_ROW mysqlQueryResultInternalMysqlRowGetter(v8::Handle<v8::Object> mysqlQueryResult){
+  return (MYSQL_ROW)v8::Local<v8::External>::Cast(mysqlQueryResult->GetInternalField(4))->Value();
+}
+
+void mysqlQueryResultInternalMysqlRowSetter(v8::Handle<v8::Object> mysqlQueryResult, MYSQL_ROW mysql_row){
+  mysqlQueryResult->SetInternalField(4, v8::External::New(mysql_row));
+}
+
+v8::Handle<v8::Value> mysqlQueryResultUse(const v8::Arguments& args) {
+  v8::Local<v8::Object> holder = args.Holder();
+  if (msyqlQueryResultInternalBufferedGetter(holder)->ToBoolean()->Value()) return v8::Null();
+  if (msyqlQueryResultInternalDoneGetter(holder)->ToBoolean()->Value()) return v8::Null();
+  MYSQL_RES *mysql_res = mysqlQueryResultInternalMysqlResGetter(holder);
+  while (mysql_fetch_row(mysql_res) != NULL);
+  return v8::Null();
+}
+void weakMysqlQueryResultCallback(v8::Persistent<v8::Value> object, void* _mysql_res) {
+  LOG_ERR("Cleaning up weak mysql query result...");
+  MYSQL_RES *mysql_res = (MYSQL_RES *)_mysql_res;
+  if (mysql_fetch_row(mysql_res)) {
+    while (mysql_fetch_row(mysql_res));
+    mysql_free_result(mysql_res);
+  }
+  object.Dispose();
+}
+
+void mysqlQueryResultFetch(v8::Handle<v8::Object> mysqlQueryResult) {
+  MYSQL_RES *mysql_res = mysqlQueryResultInternalMysqlResGetter(mysqlQueryResult);
+  MYSQL_ROW mysql_row = mysql_fetch_row(mysql_res);
+  mysqlQueryResultInternalMysqlRowSetter(mysqlQueryResult, mysql_row);
+  msyqlQueryResultInternalDoneSetter(mysqlQueryResult, mysql_row == NULL);
+}
+
+v8::Handle<v8::Value> mysqlQueryResultFetchArray(const v8::Arguments& args) {
+  v8::Local<v8::Object> mysqlQueryResult = args.Holder()->ToObject();
+  //get the "done" field
+  if (msyqlQueryResultInternalDoneGetter(mysqlQueryResult)->ToBoolean()->Value()) {
+    v8::ThrowException(v8::Exception::Error(v8::String::New("Result already exhausted")));
+    return v8::Null();
+  }
+  v8::Local<v8::Array> array;
+  switch (args.Length()) {
+    case 0: //no array was passed, create a new one.
+      array = v8::Array::New();
+      break;
+    case 1: //argument passed.
+      if (args[0]->IsArray()) array = v8::Local<v8::Array>::Cast(args[0]);
+      else v8::ThrowException(v8::Exception::Error(v8::String::New("Argument should be an array")));
+      break;
+    default:
+      v8::ThrowException(v8::Exception::Error(v8::String::New("Expect at most 1 argument")));
+      return v8::Null();
+  }
+
+  //get the row. this should have been pre-fetched.
+  MYSQL_ROW mysql_row = mysqlQueryResultInternalMysqlRowGetter(mysqlQueryResult);
+
+  //fill the array with values.
+  MYSQL_RES *mysql_res = mysqlQueryResultInternalMysqlResGetter(mysqlQueryResult);
+  unsigned int i, fieldcount = mysql_num_fields(mysql_res);
+  unsigned long *lengths = mysql_fetch_lengths(mysql_res);
+  for (i = 0; i < fieldcount; i++) {
+    array->Set(i, mysql_row[i] == NULL ? v8::Null() : v8::String::New(mysql_row[i], lengths[i]));
+  }
+
+  //fetch the next row. This automatically sets the done flag.
+  mysqlQueryResultFetch(mysqlQueryResult);
+  return array;
+}
+
+v8::Persistent<v8::ObjectTemplate> createMysqlQueryResultTemplate(){
+  v8::Handle<v8::ObjectTemplate> _mysqlQueryResultTemplate = v8::ObjectTemplate::New();
+  //0 is the result, 1 is done flag, 2 is buffered flag, 3 is query, 4 is the current row
+  _mysqlQueryResultTemplate->SetInternalFieldCount(5);
+  _mysqlQueryResultTemplate->SetAccessor(v8::String::New("done"), mysqlQueryResultDoneGetter, setConstant);
+  _mysqlQueryResultTemplate->SetAccessor(v8::String::New("buffered"), mysqlQueryResultBufferedGetter, setConstant);
+  _mysqlQueryResultTemplate->Set(v8::String::New("use"), v8::FunctionTemplate::New(mysqlQueryResultUse));
+  _mysqlQueryResultTemplate->Set(v8::String::New("fetchArray"), v8::FunctionTemplate::New(mysqlQueryResultFetchArray));
+  return v8::Persistent<v8::ObjectTemplate>::New(_mysqlQueryResultTemplate);
+}
+
+/**
+ *  MySQL bindings: Query
+ *
+ */
+v8::Handle<v8::Boolean> msyqlQueryInternalDoneGetter(v8::Handle<v8::Object> mysqlQuery){
+  return mysqlQuery->GetInternalField(1)->ToBoolean();
+}
+void msyqlQueryInternalDoneSetter(v8::Handle<v8::Object> mysqlQuery, v8::Handle<v8::Value> value){
+  mysqlQuery->SetInternalField(1, value);
+}
+
+v8::Handle<v8::Value> mysqlQueryDoneGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info) {
+  return msyqlQueryInternalDoneGetter(info.Holder());
+}
+
+MYSQL_STMT* mysqlQueryInternalMysqlStmtGetter(v8::Handle<v8::Object> mysqlQuery){
+  MYSQL_STMT *mysql_stmt = (MYSQL_STMT *)v8::Local<v8::External>::Cast(mysqlQuery->GetInternalField(3))->Value();
+  return mysql_stmt;
+}
+
+my_bool mysqlQueryCheckPrepared(v8::Handle<v8::Object> mysqlQuery) {
+  return mysqlQuery->GetInternalField(3)->IsNull() ? FALSE : TRUE;
+}
+
+v8::Handle<v8::Value> mysqlQueryPreparedGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info) {
+  return mysqlQueryCheckPrepared(info.Holder()) == TRUE ? v8::True() : v8::False();
+}
+
+v8::Handle<v8::Value> mysqlQueryParamCountGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info) {
+  v8::Local<v8::Object> holder = info.Holder();
+  if (mysqlQueryCheckPrepared(holder) == TRUE) {
+    MYSQL_STMT* mysql_stmt = mysqlQueryInternalMysqlStmtGetter(holder);
+    unsigned long count = mysql_stmt_param_count(mysql_stmt);
+    return v8::Number::New((double)count);
+  }
+  else {
+    return v8::Null();
+  }
+}
+
+my_bool checkDone(v8::Handle<v8::Object> mysqlQuery){
+  if (msyqlQueryInternalDoneGetter(mysqlQuery)->IsTrue()) return TRUE;
+  v8::ThrowException(v8::Exception::Error(v8::String::New("Not all results were consumed")));
+  return FALSE;
+}
+
+void weakMysqlQueryCallback(v8::Persistent<v8::Value> object, void* _mysql) {
+  LOG_ERR("Cleaning up weak mysql query...");
+  v8::HandleScope handle_scope;
+  v8::Local<v8::Object> mysqlQuery = object->ToObject();
+  if (mysqlQueryCheckPrepared(mysqlQuery)) {
+    MYSQL_STMT *mysql_stmt = mysqlQueryInternalMysqlStmtGetter(mysqlQuery);
+    mysql_stmt_close(mysql_stmt);
+  }
+  object.Dispose();
+}
+
+v8::Handle<v8::Value> mysqlQueryResult(const v8::Arguments& args) {
+  //holder is the query object on which the result method was called.
+  v8::Local<v8::Object> mysqlQuery = args.Holder()->ToObject();
+  //if the query's done flag is true, we bail out.
+  v8::Handle<v8::Boolean> queryDone = msyqlQueryInternalDoneGetter(mysqlQuery);
+  if (queryDone->IsTrue()) {
+    v8::ThrowException(v8::Exception::Error(v8::String::New("Results already consumed")));
+    return v8::Null();
+  }
+
+  my_bool _useOrStore;
+  v8::Local<v8::Value> arg;
+  switch (args.Length()) {
+    case 0:
+      _useOrStore = TRUE;
+      break;
+    case 1: {
+      arg = args[0];
+      if (!arg->IsBoolean()) {
+        v8::ThrowException(v8::Exception::Error(v8::String::New("Argument must be a boolean")));
+        return v8::Null();
+      }
+      _useOrStore = arg->ToBoolean()->Value() ? TRUE : FALSE;
+      break;
+    }
+    default: {
+      v8::ThrowException(v8::Exception::Error(v8::String::New("Expect at most 1 argument")));
+      return v8::Null();
+    }
+  }
+
+  v8::Local<v8::Object> mysqlQueryResult;
+  MYSQL_RES *mysql_res = NULL;
+  //TODO: properly handle diff. cases prepared / immediate
+  if (mysqlQueryCheckPrepared(mysqlQuery) == TRUE) {
+    MYSQL_STMT *mysql_stmt = mysqlQueryInternalMysqlStmtGetter(mysqlQuery);
+    if (_useOrStore == TRUE) {
+      int result = mysql_stmt_store_result(mysql_stmt);
+      if (result != 0) {
+        throwMysqlStmtException(mysqlQuery);
+      }
+    }
+  }
+  else {
+    //get the actual result.
+    MYSQL *mysql = getMySQLConnectionInternal(mysqlQuery);
+    mysql_res = _useOrStore ? mysql_store_result(mysql) : mysql_use_result(mysql);
+
+    if (mysql_res == NULL) {
+      if (_useOrStore == FALSE || mysql_errno(mysql) != 0) {
+        throwMysqlClientException(mysqlQuery);
+        return v8::False();
+      }
+      //not the kind of query that has a result.
+      //TODO: return a special result object with the number of affected rows.
+      return v8::Null();
+    }
+
+    //see if there are more results and update the done flag accordingly
+    int more_results = mysql_next_result(mysql);
+    if (more_results > 0) {
+      throwMysqlClientException(mysqlQuery);
+      return v8::Null();
+    }
+    msyqlQueryInternalDoneSetter(mysqlQuery, more_results == 0 ? v8::True() : v8::False());
+
+    mysqlQueryResult = mysqlQueryResultTemplate->NewInstance();
+    mysqlQueryResult->SetInternalField(0, v8::External::New(mysql_res));
+    //mark this result dependent upon the holder.
+    //This prevents the holder from being cleaned up before the result.
+    mysqlQueryResult->SetInternalField(3, mysqlQuery);
+    //set the result's done flag
+    msyqlQueryResultInternalDoneSetter(mysqlQueryResult, mysql_res == NULL);
+    if (mysql_res != NULL) {
+      mysqlQueryResultFetch(mysqlQueryResult);
+    }
+    //set the result's buffered flag.
+    msyqlQueryResultInternalBufferedSetter(mysqlQueryResult, _useOrStore);
+  }
+  //deliver the result.
+  v8::Persistent<v8::Object> persistentMysqlQueryResult = v8::Persistent<v8::Object>::New(mysqlQueryResult);
+  if (mysql_res) {
+    persistentMysqlQueryResult.MakeWeak(mysql_res, weakMysqlQueryResultCallback);
+  }
+  return persistentMysqlQueryResult;
+}
+
+v8::Handle<v8::Value> mysqlQueryExecute(const v8::Arguments& args) {
+  v8::Local<v8::Object> mysqlQuery = args.Holder()->ToObject();
+  //check the done field. if it's not true we can't execute.
+  //beware: done maybe True, False, or Null
+  if (!checkDone(mysqlQuery)) return v8::Null();
+
+  //process the arguments (= parameters, relevant for prepared statements)
+  switch (args.Length()) {
+    case 0:
+      break;
+    case 1: {
+      //TODO: if not prepared, bail out.
+      v8::Local<v8::Value> arg = args[0];
+      if (!arg->IsArray()) {
+        v8::ThrowException(v8::Exception::Error(v8::String::New("Argument must be an Array.")));
+        return v8::Null();
+      }
+      //for now we simply exit. If prepared we should execute with these parameters.
+      v8::ThrowException(v8::Exception::Error(v8::String::New("Parameter passing not (yet) supported.")));
+      return v8::Null();
+    }
+    default: {
+      v8::ThrowException(v8::Exception::Error(v8::String::New("Expect at most 1 argument")));
+      return v8::Null();
+    }
+  }
+
+  if (mysqlQueryCheckPrepared(mysqlQuery) == TRUE) {
+    MYSQL_STMT *mysql_stmt = mysqlQueryInternalMysqlStmtGetter(mysqlQuery);
+    if (mysql_stmt_execute(mysql_stmt) != 0) {
+      throwMysqlStmtException(mysqlQuery);
+      return v8::False();
+    }
+  }
+  else {
+    //get the statement string
+    v8::Local<v8::Value> _sql = mysqlQuery->Get(v8::String::New("sql"));
+    if (!_sql->IsString()) {
+      v8::ThrowException(v8::Exception::Error(v8::String::New("Member sql must be string")));
+      return v8::Null();
+    }
+    v8::Local<v8::String> sql = _sql->ToString();
+    v8::String::AsciiValue ascii(sql);
+
+    //execute the statement
+    MYSQL *mysql = getMySQLConnectionInternal(mysqlQuery);
+    if (mysql_real_query(mysql, *ascii, ascii.length())) {
+      throwMysqlClientException(mysqlQuery);
+      return v8::Null();
+    }
+  }
+
+  //mark as ready to fetch first result
+  msyqlQueryInternalDoneSetter(mysqlQuery, v8::False());
+
+  return v8::True();
+}
+
+v8::Handle<v8::Value> mysqlQueryPrepare(const v8::Arguments& args) {
+  v8::Local<v8::Object> mysqlQuery = args.Holder();
+  if (!checkDone(mysqlQuery)) return v8::False();
+
+  if (mysqlQueryCheckPrepared(mysqlQuery)) {
+    v8::ThrowException(v8::Exception::Error(v8::String::New("Query already prepared.")));
+    return v8::False();
+  }
+  MYSQL *mysql = getMySQLConnectionInternal(mysqlQuery);
+  MYSQL_STMT *mysql_stmt = mysql_stmt_init(mysql);
+  if (mysql_stmt == NULL) {
+    v8::ThrowException(v8::Exception::Error(v8::String::New("Failed to allocate prepared statement handle.")));
+    return v8::False();
+  }
+  v8::String::AsciiValue ascii(mysqlQuery->Get(v8::String::New("sql"))->ToString());
+
+  int prepare = mysql_stmt_prepare(mysql_stmt, *ascii, ascii.length());
+  if (prepare) {
+    throwMysqlStmtException(mysqlQuery);
+    return v8::False();
+  }
+  //TODO: BIND PARAMETES
+  int num_params = mysql_stmt_param_count(mysql_stmt);
+  //TODO: BIND RESULTS
+  int num_fields = mysql_stmt_field_count(mysql_stmt);
+
+  return v8::True();
+}
+
+v8::Persistent<v8::ObjectTemplate> createMysqlQueryTemplate(){
+  v8::Handle<v8::ObjectTemplate> _mysqlQueryTemplate = v8::ObjectTemplate::New();
+  //0 is the connection pointer, 1 is done flag, 2 is client object,
+  //In case of prepared statement:
+  //3 is the statement handle,
+  _mysqlQueryTemplate->SetInternalFieldCount(4);
+  _mysqlQueryTemplate->SetAccessor(v8::String::New("done"), mysqlQueryDoneGetter, setConstant);
+  _mysqlQueryTemplate->SetAccessor(v8::String::New("prepared"), mysqlQueryPreparedGetter, setConstant);
+  //_mysqlQueryTemplate->SetAccessor(v8::String::New("fieldCount"), mysqlQueryFieldCountGetter, setConstant);
+  _mysqlQueryTemplate->SetAccessor(v8::String::New("paramCount"), mysqlQueryParamCountGetter, setConstant);
+  _mysqlQueryTemplate->Set(v8::String::New("execute"), v8::FunctionTemplate::New(mysqlQueryExecute));
+  _mysqlQueryTemplate->Set(v8::String::New("result"), v8::FunctionTemplate::New(mysqlQueryResult));
+  _mysqlQueryTemplate->Set(v8::String::New("prepare"), v8::FunctionTemplate::New(mysqlQueryPrepare));
+  return v8::Persistent<v8::ObjectTemplate>::New(_mysqlQueryTemplate);
+}
+
+v8::Handle<v8::Value> createMysqlQuery(const v8::Arguments& args) {
+  if (args.Length() != 1) {
+    v8::ThrowException(v8::Exception::Error(v8::String::New("Expect exactly 1 argument")));
+    return v8::Null();
+  }
+  v8::Local<v8::Value> arg = args[0];
+  if (!arg->IsString()) {
+    v8::ThrowException(v8::Exception::Error(v8::String::New("Argument must be string")));
+    return v8::Null();
+  }
+  //holder is the mysql client object.
+  v8::Local<v8::Object> holder = args.Holder()->ToObject();
+  MYSQL *mysql = getMySQLConnectionInternal(holder);
+
+  //make a new query object
+  v8::Local<v8::Object> mysqlQuery = mysqlQueryTemplate->NewInstance();
+  mysqlQuery->SetInternalField(0, v8::External::New(mysql));
+  //False = More results. Null = ready to get first result. True = done.
+  msyqlQueryInternalDoneSetter(mysqlQuery, v8::True());
+  //mark the query dependent upon the client object.
+  mysqlQuery->SetInternalField(2, holder);
+  mysqlQuery->SetInternalField(3, v8::Null());
+  mysqlQuery->Set(v8::String::New("sql"), arg->ToString());
+  //deliver the query object.
+  v8::Persistent<v8::Object> persistentMysqlQuery = v8::Persistent<v8::Object>::New(mysqlQuery);
+  persistentMysqlQuery.MakeWeak(mysql, weakMysqlQueryCallback);
+  return persistentMysqlQuery;
+}
+
+/**
+ *  MySQL bindings: Connection
+ *
+ */
+v8::Handle<v8::Value> mysqlConnectionClose(const v8::Arguments& args) {
+  v8::Local<v8::Object> holder = args.Holder();
+  MYSQL *mysql = getMySQLConnectionInternal(holder, FALSE);
+  if (mysql == NULL) return v8::False();
+  mysql_close(mysql);
+  holder->SetInternalField(0, v8::External::New(NULL));
+  return v8::True();
+}
+
+v8::Handle<v8::Value> mysqlConnectionConnectedGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info) {
+  MYSQL *mysql = getMySQLConnectionInternal(info.Holder(), FALSE);
+  return (mysql == NULL) ? v8::False() : v8::True();
+}
+
+v8::Handle<v8::Value> mysqlConnectionCommit(const v8::Arguments& args) {
+  MYSQL *mysql = getMySQLConnectionInternal(args.Holder());
+  if (mysql_commit(mysql)) {
+    throwMysqlClientException(args.Holder());
+    return v8::Null();
+  }
+  return v8::True();
+}
+
+v8::Handle<v8::Value> mysqlConnectionRollback(const v8::Arguments& args) {
+  MYSQL *mysql = getMySQLConnectionInternal(args.Holder());
+  if (mysql_rollback(mysql)) {
+    throwMysqlClientException(args.Holder());
+    return v8::Null();
+  }
+  return v8::True();
+}
+
+v8::Handle<v8::Value> mysqlConnectionHostInfoGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info) {
+  MYSQL *mysql = getMySQLConnectionInternal(info.Holder());
+  return v8::String::New(mysql_get_host_info(mysql));
+}
+
+v8::Handle<v8::Value> mysqlConnectionProtocolInfoGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info) {
+  MYSQL *mysql = getMySQLConnectionInternal(info.Holder());
+  return v8::Integer::New(mysql_get_proto_info(mysql));
+}
+
+v8::Handle<v8::Value> mysqlConnectionServerInfoGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info) {
+  MYSQL *mysql = getMySQLConnectionInternal(info.Holder());
+  return v8::String::New(mysql_get_server_info(mysql));
+}
+
+v8::Handle<v8::Value> mysqlConnectionAffectedRowsGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info) {
+  MYSQL *mysql = getMySQLConnectionInternal(info.Holder());
+  my_ulonglong result = mysql_affected_rows(mysql);
+  if (result == (my_ulonglong)~0) {
+    throwMysqlClientException(info.Holder());
+    return v8::Null();
+  }
+  return v8::Number::New((double)result);
+}
+
+v8::Handle<v8::Value> mysqlConnectionWarningsGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info) {
+  MYSQL *mysql = getMySQLConnectionInternal(info.Holder());
+  return v8::Integer::New(mysql_warning_count(mysql));
+}
+
+v8::Handle<v8::Value> mysqlConnectionInsertIdGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info) {
+  MYSQL *mysql = getMySQLConnectionInternal(info.Holder());
+  return v8::Number::New((double)mysql_insert_id(mysql));
+}
+
+v8::Handle<v8::Value> mysqlConnectionStatGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info) {
+  MYSQL *mysql = getMySQLConnectionInternal(info.Holder());
+  const char *stat = mysql_stat(mysql);
+  if (stat == NULL) {
+    throwMysqlClientException(info.Holder());
+    return v8::Null();
+  }
+  return v8::String::New(stat);
+}
+
+v8::Handle<v8::Value> mysqlConnectionCharsetGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info) {
+  MYSQL *mysql = getMySQLConnectionInternal(info.Holder());
+  return v8::String::New(mysql_character_set_name(mysql));
+}
+
+void mysqlConnectionCharsetSetter(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info) {
+  MYSQL *mysql = getMySQLConnectionInternal(info.Holder());
+  v8::String::AsciiValue ascii(value);
+  if (mysql_set_character_set(mysql, *ascii)) {
+    throwMysqlClientException(info.Holder());
+  }
+}
+
+v8::Persistent<v8::ObjectTemplate> createMysqlConnectionTemplate(){
+  v8::Handle<v8::ObjectTemplate> _mysqlConnectionTemplate = v8::ObjectTemplate::New();
+  _mysqlConnectionTemplate->SetInternalFieldCount(1);
+  _mysqlConnectionTemplate->Set(v8::String::New("close"), v8::FunctionTemplate::New(mysqlConnectionClose));
+  _mysqlConnectionTemplate->Set(v8::String::New("commit"), v8::FunctionTemplate::New(mysqlConnectionCommit));
+  _mysqlConnectionTemplate->Set(v8::String::New("rollback"), v8::FunctionTemplate::New(mysqlConnectionRollback));
+  _mysqlConnectionTemplate->Set(v8::String::New("query"), v8::FunctionTemplate::New(createMysqlQuery));
+
+  //TODO: probably should call affectedRows automatically inside the query object so each query object maintains their own info.
+  _mysqlConnectionTemplate->SetAccessor(v8::String::New("affectedRows"), mysqlConnectionAffectedRowsGetter, setConstant);
+
+  _mysqlConnectionTemplate->SetAccessor(v8::String::New("charset"), mysqlConnectionCharsetGetter, mysqlConnectionCharsetSetter);
+  _mysqlConnectionTemplate->SetAccessor(v8::String::New("connected"), mysqlConnectionConnectedGetter, setConstant);
+  _mysqlConnectionTemplate->SetAccessor(v8::String::New("hostInfo"), mysqlConnectionHostInfoGetter, setConstant);
+  _mysqlConnectionTemplate->SetAccessor(v8::String::New("insertId"), mysqlConnectionInsertIdGetter, setConstant);
+  _mysqlConnectionTemplate->SetAccessor(v8::String::New("protocolVersion"),  mysqlConnectionProtocolInfoGetter, setConstant);
+  _mysqlConnectionTemplate->SetAccessor(v8::String::New("serverVersion"), mysqlConnectionServerInfoGetter, setConstant);
+  _mysqlConnectionTemplate->SetAccessor(v8::String::New("stat"), mysqlConnectionStatGetter, setConstant);
+  _mysqlConnectionTemplate->SetAccessor(v8::String::New("warnings"), mysqlConnectionWarningsGetter, setConstant);
+  return v8::Persistent<v8::ObjectTemplate>::New(_mysqlConnectionTemplate);
+}
+
+/**
+ *  MySQL bindings: Client
+ *
+ */
+my_bool getStringFromObject(v8::Local<v8::Object> argObject, v8::Persistent<v8::String> key, char *buffer, const char *error) {
+  v8::Local<v8::Value> value;
+  if (argObject->Has(key)) {
+    value = argObject->Get(key);
+    if (value->IsString()) {
+      v8::String::AsciiValue ascii(value->ToString());
+      strcpy(buffer, *ascii);
+    }
+    else {
+      v8::ThrowException(v8::Exception::Error(v8::String::New(error)));
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+my_bool getUint32FromObject(v8::Local<v8::Object> argObject, v8::Persistent<v8::String> key, unsigned short *buffer, const char *error){
+  v8::Local<v8::Value> value;
+  if (argObject->Has(key)) {
+    value = argObject->Get(key);
+    if (value->IsUint32()) {
+      *buffer = value->ToUint32()->Value();
+    }
+    else {
+      v8::ThrowException(v8::Exception::Error(v8::String::New(error)));
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+my_bool getUint64FromObject(v8::Local<v8::Object> argObject, v8::Persistent<v8::String> key, unsigned long *buffer, const char *error){
+  v8::Local<v8::Value> value;
+  if (argObject->Has(key)) {
+    value = argObject->Get(key);
+    if (value->IsNumber()) {
+      *buffer = value->ToInteger()->Value();
+    }
+    else {
+      v8::ThrowException(v8::Exception::Error(v8::String::New(error)));
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+v8::Handle<v8::Value> mysqlClientConnect(const v8::Arguments& args) {
+  //TODO: create a real mysql connection
+  MYSQL *mysql = mysql_init(NULL);
+  if (mysql == NULL) {
+    LOG_ERR("Error allocating MySQL resource");
+    v8::ThrowException(v8::Exception::Error(v8::String::New("Couldn't allocate mysql resource.")));
+    return v8::Null();
+  }
+
+  v8::HandleScope handle_scope;
+  char host[64]; strcpy(host, "localhost");
+  char user[16]; strcpy(user, "");
+  char password[16]; strcpy(password, "");
+  char schema[64]; strcpy(schema, "");
+  unsigned short port = 3306;
+  char socket[128]; strcpy(socket, "");
+  unsigned long flags = CLIENT_IGNORE_SPACE | CLIENT_MULTI_STATEMENTS;
+
+  if (args.Length()) {
+    v8::Local<v8::Value> arg = args[0];
+    if (!arg->IsObject()) {
+      v8::ThrowException(v8::Exception::Error(v8::String::New("Argument must be an object.")));
+      return v8::Null();
+    }
+    v8::Local<v8::Object> argObject = arg->ToObject();
+    v8::Local<v8::String> key;
+
+    if (getStringFromObject(argObject, str_host, host, "host must be a string.") == FALSE) return v8::Null();
+    if (getStringFromObject(argObject, str_user, user, "user must be a string.") == FALSE) return v8::Null();
+    if (getStringFromObject(argObject, str_password, password, "password must be a string.") == FALSE) return v8::Null();
+    if (getStringFromObject(argObject, str_schema, schema, "schema must be a string.") == FALSE) return v8::Null();
+    if (getStringFromObject(argObject, str_socket, socket, "socket must be a string.") == FALSE) return v8::Null();
+    if (getUint32FromObject(argObject, str_port, &port, "port must be an integer.") == FALSE) return v8::Null();
+    //if (getUint64FromObject(argObject, str_flags, &flags, "flags must be an integer.") == FALSE) return v8::Null();
+
+  }
+
+  if (mysql_real_connect(
+    mysql, host, user, password,
+    strlen(schema) ? schema : NULL, port,
+    strlen(socket) ? socket : NULL, flags
+  ) == NULL) {
+    LOG_ERR("Error connecting to MySQL");
+    LOG_ERR(mysql_error(mysql));
+    mysql_close(mysql);
+    v8::ThrowException(v8::Exception::Error(v8::String::New("Can't connect to MySQL.")));
+    return v8::Null();
+  }
+
+  v8::Local<v8::Object> mysqlConnection = mysqlConnectionTemplate->NewInstance();
+  mysqlConnection->SetInternalField(0, v8::External::New(mysql));
+
+  v8::Persistent<v8::Object> persistentMysqlConnection = v8::Persistent<v8::Object>::New(mysqlConnection);
+  persistentMysqlConnection.MakeWeak(mysql, weakMysqlConnectionCallback);
+  return persistentMysqlConnection;
+}
+
+v8::Handle<v8::Value> getMySQlClientVersion(v8::Local<v8::String> property, const v8::AccessorInfo &info) {
+  return v8::String::New(mysql_get_client_info());
+}
+
+v8::Persistent<v8::ObjectTemplate> createMysqlClientTemplate(){
+  v8::Handle<v8::ObjectTemplate> _mysqlClientTemplate = v8::ObjectTemplate::New();
+  _mysqlClientTemplate->Set(v8::String::New("connect"), v8::FunctionTemplate::New(mysqlClientConnect));
+  _mysqlClientTemplate->SetAccessor(v8::String::New("version"), getMySQlClientVersion, setConstant);
+  return v8::Persistent<v8::ObjectTemplate>::New(_mysqlClientTemplate);
+}
+
+/**
+ *  MySQL bindings: "namespace"
+ *
+ */
+v8::Persistent<v8::ObjectTemplate> createMysqlTemplate(){
+  v8::Handle<v8::ObjectTemplate> _mysqlTemplate = v8::ObjectTemplate::New();
+  _mysqlTemplate->Set(v8::String::New("client"), mysqlClientTemplate->NewInstance());
+  return v8::Persistent<v8::ObjectTemplate>::New(_mysqlTemplate);
+}
+
+/**
+ *  Global Object
  */
 v8::Persistent<v8::ObjectTemplate> createGlobalTemplate(){
   v8::Handle<v8::ObjectTemplate> _template = v8::ObjectTemplate::New();
+  //internal field is used to bind UDF_INIT pointer.
   _template->SetInternalFieldCount(1);
+  _template->Set(v8::String::New("mysql"), mysqlTemplate->NewInstance());
   return v8::Persistent<v8::ObjectTemplate>::New(_template);
-}
-
-//create a global object template used to initialize
-//the scripts' global execution environment.
-v8::Handle<v8::ObjectTemplate> getGlobalTemplate(){
-  //static ensures we will only create the template once.
-  //TODO: create a daemon plugin that manages shared global resources
-//  static v8::Persistent<v8::ObjectTemplate> globalTemplate = createGlobalTemplate();
-  return globalTemplate;
 }
 
 /**
@@ -381,14 +1114,6 @@ v8::Handle<v8::ObjectTemplate> getGlobalTemplate(){
  *  Wrapping useful udf constants
  *
  */
-void setConstant(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
-  v8::ThrowException(
-    v8::Exception::Error(
-      v8::String::New(MSG_ERR_SETTING_API_CONSTANT)
-    )
-  );
-}
-
 v8::Handle<v8::Value> getStringResultConstant(v8::Local<v8::String> property, const v8::AccessorInfo& info){
   return v8::Uint32::New(STRING_RESULT);
 }
@@ -476,7 +1201,9 @@ void add_udf_init_accessors(v8::Local<v8::Object> object, UDF_INIT* initid){
 }
 
 /**
+ *
  *  js_daemon plugin
+ *
  */
 v8::HeapStatistics *createHeapStatistics(){
   v8::HeapStatistics *heapStatistics = new v8::HeapStatistics();
@@ -564,6 +1291,13 @@ static struct st_mysql_sys_var *js_daemon_system_vars[]= {
   NULL
 };
 
+/**
+ *
+ *  UDF utility methods
+ *
+ */
+
+//check for initial script argument
 my_bool js_check_arguments(UDF_ARGS *args, char *message){
   //validate arguments
   if (args->arg_count < 1) {
@@ -577,6 +1311,7 @@ my_bool js_check_arguments(UDF_ARGS *args, char *message){
   return INIT_SUCCESS;
 }
 
+//allocate memory to hold the result.
 my_bool js_alloc_resources(UDF_INIT *initid, UDF_ARGS *args, char *message) {
   initid->ptr = (char *)malloc(sizeof(V8RES));
   if (initid->ptr == NULL) {
@@ -597,6 +1332,7 @@ my_bool js_alloc_resources(UDF_INIT *initid, UDF_ARGS *args, char *message) {
   return INIT_SUCCESS;
 }
 
+//set some sensible defaults for the UDF's return value
 void js_set_initid_defaults(UDF_INIT *initid) {
   //set default properties of the return value.
   initid->max_length = JS_MAX_RETURN_VALUE_LENGTH;  //blob. for varchar, use smaller max_length
@@ -604,12 +1340,13 @@ void js_set_initid_defaults(UDF_INIT *initid) {
   initid->const_item = FALSE;                       //script author can always write a non-deterministic script
 }
 
+//compile script argument
 my_bool js_pre_compile(UDF_INIT *initid, UDF_ARGS *args, char *message){
   //check if we can pre-compile the script
   V8RES *v8res = (V8RES *)initid->ptr;
   if (args->args[0] == FALSE) {
     //script argument is not a constant.
-    v8res->compiled = 0;
+    v8res->compiled = COMPILED_NO;
     return INIT_SUCCESS;
   }
 
@@ -619,14 +1356,13 @@ my_bool js_pre_compile(UDF_INIT *initid, UDF_ARGS *args, char *message){
     getScriptArgValue(args, 0)
   );
   if (v8res->script.IsEmpty()) {
-    const char *exceptionMessage = getExceptionString(&try_catch);
     strcpy(message, MSG_SCRIPT_COMPILATION_FAILED);
     LOG_ERR(MSG_SCRIPT_COMPILATION_FAILED);
-    LOG_ERR(exceptionMessage);
+    LOG_ERR(*v8::String::AsciiValue(try_catch.Exception()));
     v8res->context->Exit();
     return INIT_ERROR;
   }
-  v8res->compiled = 1;
+  v8res->compiled = COMPILED_YES;
   return INIT_SUCCESS;
 }
 
@@ -635,7 +1371,7 @@ my_bool js_pre_compile(UDF_INIT *initid, UDF_ARGS *args, char *message){
 extern "C" {
 #endif
 
-//the UDF init function.
+//the js UDF init function.
 //called once by the mysql server
 //before running the udf row level function
 my_bool js_init(UDF_INIT *initid, UDF_ARGS *args, char *message){
@@ -649,7 +1385,7 @@ my_bool js_init(UDF_INIT *initid, UDF_ARGS *args, char *message){
 
   //set up a context
   V8RES *v8res = (V8RES *)initid->ptr;
-  v8res->context = v8::Context::New(NULL, getGlobalTemplate());
+  v8res->context = v8::Context::New(NULL, globalTemplate);
   if (v8res->context.IsEmpty()) {
     strcpy(message, MSG_CREATE_CONTEXT_FAILED);
     return INIT_ERROR;
@@ -666,16 +1402,20 @@ my_bool js_init(UDF_INIT *initid, UDF_ARGS *args, char *message){
   return INIT_SUCCESS;
 }
 
-my_bool jsudf_init(
-  UDF_INIT *initid,
-  UDF_ARGS *args,
-  char *message
-){
+my_bool jserr_init(UDF_INIT *initid, UDF_ARGS *args, char *message) {
+  if (js_init(initid, args, message) == INIT_ERROR) {
+    if (strcmp(message, MSG_SCRIPT_COMPILATION_FAILED)) return INIT_ERROR;
+  }
+  return INIT_SUCCESS;
+}
+
+//The jsudf init function
+my_bool jsudf_init(UDF_INIT *initid, UDF_ARGS *args, char *message){
   if (js_init(initid, args, message) == INIT_ERROR) {
     return INIT_ERROR;
   }
   V8RES *v8res = (V8RES *)initid->ptr;
-  if (v8res->compiled != TRUE) {
+  if (v8res->compiled != COMPILED_YES) {
     strcpy(message, MSG_STATIC_SCRIPT_REQUIRED);
     return INIT_ERROR;
   }
@@ -688,7 +1428,7 @@ my_bool jsudf_init(
 
   v8::Local<v8::Value> value = v8res->script->Run();
   if (value.IsEmpty()) {
-    LOG_ERR(getExceptionString(&try_catch));
+    LOG_ERR(*v8::String::AsciiValue(try_catch.Exception()));
     strcpy(message, MSG_RUNTIME_SCRIPT_ERROR);
     v8res->context->Exit();
     return INIT_ERROR;
@@ -706,9 +1446,12 @@ my_bool jsudf_init(
   }
   func = v8::Handle<v8::Function>::Cast(member);
   v8res->udf = v8::Persistent<v8::Function>::New(func);
-  v8res->compiled |= 2;
+  v8res->compiled |= COMPILED_UDF;
 
-  //set UDF_INIT variables:
+  //set UDF_INIT variables.
+  //in this particular case, we need the prototype, since that is
+  //the object that was created from our template, and that is the object
+  //that has the internal field that we need to interface with initid.
   add_udf_init_accessors(global->GetPrototype()->ToObject(), initid);
 
   add_udf_constants(global);
@@ -725,6 +1468,8 @@ my_bool jsudf_init(
     value = func->Call(global, args->arg_count - 1, v8res->arg_values);
     if (value.IsEmpty()) {
       //todo: get exception message
+      v8::Local<v8::String> exception = try_catch.Exception()->ToString();
+      exception->WriteAscii(message, 0, exception->Length() > UDF_MAX_ERROR_MSG_LENGTH ? UDF_MAX_ERROR_MSG_LENGTH : exception->Length());
       v8res->context->Exit();
       return INIT_ERROR;
     }
@@ -739,11 +1484,8 @@ my_bool jsudf_init(
   return INIT_SUCCESS;
 }
 
-my_bool jsagg_init(
-  UDF_INIT *initid,
-  UDF_ARGS *args,
-  char *message
-){
+//The jsagg init function
+my_bool jsagg_init(UDF_INIT *initid, UDF_ARGS *args, char *message){
   if (jsudf_init(initid, args, message) == INIT_ERROR) {
     return INIT_ERROR;
   }
@@ -767,7 +1509,7 @@ my_bool jsagg_init(
   }
   func = v8::Handle<v8::Function>::Cast(member);
   v8res->clear = v8::Persistent<v8::Function>::New(func);
-  v8res->compiled |= 4;
+  v8res->compiled |= COMPILED_CLEAR;
 
   member = global->Get(v8::String::New("agg"));
   if (!member->IsFunction()) {
@@ -777,7 +1519,7 @@ my_bool jsagg_init(
   }
   func = v8::Handle<v8::Function>::Cast(member);
   v8res->agg = v8::Persistent<v8::Function>::New(func);
-  v8res->compiled |= 8;
+  v8res->compiled |= COMPILED_AGG;
 
   v8res->context->Exit();
   return INIT_SUCCESS;
@@ -786,9 +1528,7 @@ my_bool jsagg_init(
 //the udf deinit function.
 //called once by the mysql server after finishing running the row-level function
 //for all rows.
-void js_deinit(
-  UDF_INIT *initid
-){
+void js_deinit(UDF_INIT *initid){
   if (initid->ptr == NULL) return;
   //clean up v8
   V8RES *v8res = (V8RES *)initid->ptr;
@@ -797,22 +1537,30 @@ void js_deinit(
   if (v8res->arg_values != NULL) free(v8res->arg_values);
   //v8 introductory voodoo incantations
   v8::Locker locker;
-  if (v8res->compiled & 1) {
+  if (v8res->compiled & COMPILED_YES) {
     v8res->script.Dispose();
   }
   v8res->arguments.Dispose();
   v8res->context.Dispose();
   v8res->context.Clear();
   free(v8res);
+
+  //TODO: mark somewhere if we need to force cleanup, and only do the
+  //clean up if the mark is set.
+  force_v8_cleanup();
 }
 
-void jsudf_deinit(
-  UDF_INIT *initid
-){
+void jserr_deinit(UDF_INIT *initid) {
+  if (initid->ptr == NULL) return;
+  js_deinit(initid);
+}
+
+//The jsudf deinit function
+void jsudf_deinit(UDF_INIT *initid){
   if (initid->ptr == NULL) return;
   //clean up v8
   V8RES *v8res = (V8RES *)initid->ptr;
-  if (v8res->compiled & 2) {
+  if (v8res->compiled & COMPILED_UDF) {
     v8res->udf.Dispose();
     v8res->compiled = TRUE;
   }
@@ -823,29 +1571,29 @@ void jsudf_deinit(
   //v8::Context::Scope context_scope(v8res->context);
   v8::HandleScope handle_scope;
 
+  //check if a udf_deinit exists; if so, call it.
   v8::Local<v8::Object> global = v8res->context->Global();
   v8::Handle<v8::Value> member = global->Get(v8::String::New("deinit"));
   if (member->IsFunction()) {
     v8::Handle<v8::Function> func = v8::Handle<v8::Function>::Cast(member);
     func->Call(global, 0, v8res->arg_values);
   }
+
   v8res->context->Exit();
-  //TODO: check if a udf_deinit exists, and call it.
   js_deinit(initid);
 }
 
-void jsagg_deinit(
-  UDF_INIT *initid
-){
+//The jsagg deinit function
+void jsagg_deinit(UDF_INIT *initid){
   if (initid->ptr == NULL) return;
   //clean up v8
   V8RES *v8res = (V8RES *)initid->ptr;
   v8::Locker locker;
   v8::TryCatch try_catch;
-  if (v8res->compiled & 8) {
+  if (v8res->compiled & COMPILED_AGG) {
     v8res->agg.Dispose();
   }
-  if (v8res->compiled & 4) {
+  if (v8res->compiled & COMPILED_CLEAR) {
     v8res->clear.Dispose();
   }
   jsudf_deinit(initid);
@@ -876,7 +1624,7 @@ char *js(
 
   //get script to execute
   v8::Handle<v8::Script> script;
-  if (v8res->compiled == TRUE){ //already compiled.
+  if (v8res->compiled == COMPILED_YES){ //already compiled.
     script = v8res->script;
   }
   else {                        //compile on the fly
@@ -893,7 +1641,7 @@ char *js(
   v8::Handle<v8::Value> value = script->Run();
   if (value.IsEmpty()){
     LOG_ERR(MSG_RUNTIME_SCRIPT_ERROR);
-    LOG_ERR(getExceptionString(&try_catch));
+    LOG_ERR(*v8::String::AsciiValue(try_catch.Exception()));
     *error = TRUE;
     v8res->context->Exit();
     return NULL;
@@ -910,6 +1658,82 @@ char *js(
   strcpy(v8res->result, *ascii);
   v8res->context->Exit();
   return v8res->result;
+}
+
+char *jserr(
+  UDF_INIT *initid,
+  UDF_ARGS *args,
+  char *result,
+  unsigned long *length,
+  my_bool *is_null,
+  my_bool *error
+){
+  //more sacrifices to the v8 deities.
+  V8RES *v8res = (V8RES *)initid->ptr;
+
+  v8::Locker locker;
+  v8::TryCatch try_catch;
+  v8res->context->Enter();
+  v8::Context::Scope context_scope(v8res->context);
+  v8::HandleScope handle_scope;
+
+  try_catch.SetVerbose(true);
+  try_catch.SetCaptureMessage(true);
+
+  //assign argument array entries for this row;
+  assignArguments(v8res, args);
+
+  int lineno = 0;
+  int startColumn = 0;
+  int endColumn = 0;
+
+  //get script to execute
+  v8::Handle<v8::Script> script = getScriptArgValue(args, 0);
+  if (script.IsEmpty()) {
+    LOG_ERR(MSG_SCRIPT_COMPILATION_FAILED);
+    v8::String::AsciiValue ascii1(try_catch.Exception());
+    v8::Local<v8::Message> message = try_catch.Message();
+    lineno = message->GetLineNumber();
+    startColumn = message->GetStartColumn();
+    endColumn = message->GetEndColumn();
+
+    *length = 60 + (endColumn - startColumn) + (unsigned long)ascii1.length();
+    if (alloc_result(v8res, length) == INIT_ERROR) {
+      LOG_ERR(MSG_RESULT_ALLOCATION_FAILED);
+      *error = TRUE;
+      return NULL;
+    }
+    sprintf(v8res->result, "Line %u, columns %u - %u: %s", lineno, startColumn, endColumn, *ascii1);
+    *length = strlen(v8res->result);
+    v8res->context->Exit();
+    return v8res->result;
+  }
+
+  //execute and get value
+  v8::Handle<v8::Value> value = script->Run();
+  if (value.IsEmpty()){
+    LOG_ERR(MSG_RUNTIME_SCRIPT_ERROR);
+    v8::String::AsciiValue ascii(try_catch.Exception());
+    v8::Local<v8::Message> message = try_catch.Message();
+    startColumn = message->GetStartColumn();
+    endColumn = message->GetEndColumn();
+
+    *length = 60 + (unsigned long)ascii.length();
+    if (alloc_result(v8res, length) == INIT_ERROR) {
+      LOG_ERR(MSG_RESULT_ALLOCATION_FAILED);
+      *error = TRUE;
+      return NULL;
+    }
+    sprintf(v8res->result, "Line %u, columns %u - %u: %s", lineno, startColumn, endColumn, *ascii);
+    *length = strlen(v8res->result);
+    v8res->context->Exit();
+    return v8res->result;
+  }
+  v8res->context->Exit();
+
+  //return the value returned by the script
+  *length = strlen(MSG_OK);
+  return (char *)MSG_OK;
 }
 
 char* jsudf(
@@ -989,11 +1813,20 @@ struct st_mysql_daemon js_daemon_info = {
 
 static int js_daemon_plugin_init(MYSQL_PLUGIN){
   LOG_ERR(MSG_JS_DAEMON_STARTUP);
+
   v8::Locker locker;
   v8::HandleScope handle_scope;
   js_daemon_heap_statistics = createHeapStatistics();
   jsDaemonContext = v8::Context::New();
   jsDaemonContext->Enter();
+
+  mysqlExceptionTemplate = createMysqlExceptionTemplate();
+  mysqlQueryResultTemplate = createMysqlQueryResultTemplate();
+  mysqlQueryTemplate = createMysqlQueryTemplate();
+  mysqlConnectionTemplate = createMysqlConnectionTemplate();
+  mysqlClientTemplate = createMysqlClientTemplate();
+  mysqlTemplate = createMysqlTemplate();
+
   globalTemplate = createGlobalTemplate();
 
   str_STRING_RESULT = v8::Persistent<v8::String>::New(v8::String::New("STRING_RESULT"));
@@ -1013,15 +1846,40 @@ static int js_daemon_plugin_init(MYSQL_PLUGIN){
   str_type = v8::Persistent<v8::String>::New(v8::String::New("type"));
   str_value = v8::Persistent<v8::String>::New(v8::String::New("value"));
 
+  str_host = v8::Persistent<v8::String>::New(v8::String::New("host"));
+  str_user = v8::Persistent<v8::String>::New(v8::String::New("user"));
+  str_password = v8::Persistent<v8::String>::New(v8::String::New("password"));
+  str_socket = v8::Persistent<v8::String>::New(v8::String::New("socket"));
+  str_schema = v8::Persistent<v8::String>::New(v8::String::New("schema"));
+  str_port = v8::Persistent<v8::String>::New(v8::String::New("port"));
+  str_flags = v8::Persistent<v8::String>::New(v8::String::New("flags"));
+
+  str_code = v8::Persistent<v8::String>::New(v8::String::New("code"));
+  str_message = v8::Persistent<v8::String>::New(v8::String::New("message"));
+  str_sqlstate = v8::Persistent<v8::String>::New(v8::String::New("sqlstate"));
+
+  str_CONNECTION_ALREADY_CLOSED = v8::Persistent<v8::String>::New(v8::String::New("Connection already closed."));
+
   jsDaemonContext->Exit();
+
+  LOG_ERR(MSG_JS_DAEMON_STARTED);
   return 0;
 }
 
 static int js_daemon_plugin_deinit(MYSQL_PLUGIN){
+  LOG_ERR(MSG_JS_DAEMON_SHUTTING_DOWN);
   v8::Locker locker;
   v8::HandleScope handle_scope;
   jsDaemonContext->Enter();
+
   globalTemplate.Dispose();
+
+  mysqlTemplate.Dispose();
+  mysqlClientTemplate.Dispose();
+  mysqlConnectionTemplate.Dispose();
+  mysqlQueryTemplate.Dispose();
+  mysqlQueryResultTemplate.Dispose();
+  mysqlExceptionTemplate.Dispose();
 
   str_STRING_RESULT.Dispose();
   str_INT_RESULT.Dispose();
@@ -1040,10 +1898,25 @@ static int js_daemon_plugin_deinit(MYSQL_PLUGIN){
   str_type.Dispose();
   str_value.Dispose();
 
+  str_host.Dispose();
+  str_schema.Dispose();
+  str_user.Dispose();
+  str_password.Dispose();
+  str_socket.Dispose();
+  str_port.Dispose();
+  str_flags.Dispose();
+
+  str_code.Dispose();
+  str_message.Dispose();
+  str_sqlstate.Dispose();
+
+  str_CONNECTION_ALREADY_CLOSED.Dispose();
+
   jsDaemonContext->Exit();
   jsDaemonContext.Dispose();
-  LOG_ERR(MSG_JS_DAEMON_SHUTDOWN);
   v8::V8::Dispose();
+
+  LOG_ERR(MSG_JS_DAEMON_SHUTDOWN);
   return 0;
 }
 
@@ -1053,11 +1926,11 @@ mysql_declare_plugin(js_daemon)
   &js_daemon_info,
   "js_daemon",
   "Roland Bouman",
-  "Javascript Daemon",
+  "Javascript Daemon - Manages resources for the js* UDFs.",
   PLUGIN_LICENSE_GPL,
-  js_daemon_plugin_init, /* Plugin Init */
-  js_daemon_plugin_deinit, /* Plugin Deinit */
-  0x0100 /* 1.0 */,
+  js_daemon_plugin_init,      /* Plugin Init */
+  js_daemon_plugin_deinit,    /* Plugin Deinit */
+  0x0100                      /* 1.0 */,
   js_daemon_status_vars,      /* status variables                */
   js_daemon_system_vars,      /* system variables                */
   NULL                        /* config options                  */
