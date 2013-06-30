@@ -70,6 +70,19 @@ static v8::Persistent<v8::String> str_REAL_RESULT;
 static v8::Persistent<v8::String> str_ROW_RESULT;
 static v8::Persistent<v8::String> str_NOT_FIXED_DEC;
 
+static v8::Persistent<v8::String> str_org_name;
+static v8::Persistent<v8::String> str_table;
+static v8::Persistent<v8::String> str_org_table;
+static v8::Persistent<v8::String> str_length;
+static v8::Persistent<v8::String> str_primary_key;
+static v8::Persistent<v8::String> str_unique_key;
+static v8::Persistent<v8::String> str_multiple_key;
+static v8::Persistent<v8::String> str_unsigned;
+static v8::Persistent<v8::String> str_zerofill;
+static v8::Persistent<v8::String> str_binary;
+static v8::Persistent<v8::String> str_auto_increment;
+static v8::Persistent<v8::String> str_numeric;
+
 static v8::Persistent<v8::String> str_host;
 static v8::Persistent<v8::String> str_user;
 static v8::Persistent<v8::String> str_password;
@@ -477,18 +490,18 @@ v8::Handle<v8::Value> msyqlQueryResultInternalDoneGetter(v8::Handle<v8::Object> 
   return mysqlQueryResult->GetInternalField(1);
 }
 
+void cleanupMysqlQueryResult(v8::Handle<v8::Object> mysqlQueryResult){
+  MYSQL_RES* mysql_res = mysqlQueryResultInternalMysqlResGetter(mysqlQueryResult);
+  if (mysql_res == NULL) return;
+  //exhaust the result set.
+  while (mysql_fetch_row(mysql_res));
+  //free the result
+  mysql_free_result(mysql_res);
+  //null the pointer
+  mysqlQueryResult->SetInternalField(0, v8::External::New(NULL));
+}
+
 void msyqlQueryResultInternalDoneSetter(v8::Handle<v8::Object> mysqlQueryResult, my_bool value){
-  if (value == TRUE) {
-    MYSQL_RES* mysql_res = mysqlQueryResultInternalMysqlResGetter(mysqlQueryResult);
-    if (mysql_res != NULL) {
-      //exhaust the result set.
-      while (mysql_fetch_row(mysql_res));
-      //free the result
-      mysql_free_result(mysql_res);
-      //null the pointer
-      mysqlQueryResult->SetInternalField(0, v8::External::New(NULL));
-    }
-  }
   //set the actual field
   mysqlQueryResult->SetInternalField(1, value ? v8::True() : v8::False());
 }
@@ -500,6 +513,7 @@ void mysqlQueryResultDoneSetter(v8::Local<v8::String> property, v8::Local<v8::Va
     v8::ThrowException(v8::Exception::Error(v8::String::New("Resultset already exhausted")));
     return;
   }
+  cleanupMysqlQueryResult(mysqlQueryResult);
   msyqlQueryResultInternalDoneSetter(mysqlQueryResult, TRUE);
 }
 
@@ -537,10 +551,14 @@ void weakMysqlQueryResultCallback(v8::Persistent<v8::Value> object, void* _mysql
   v8::HandleScope handle_scope;
   v8::Handle<v8::Object> mysqlQueryResult = object->ToObject();
   FIELD_EXTRACTOR *field_extractors = mysqlQueryResultInternalExtractorsGetter(mysqlQueryResult);
-  if (field_extractors != NULL) free(field_extractors);
+  if (field_extractors != NULL) {
+    free(field_extractors);
+    mysqlQueryResult->SetInternalField(5, v8::External::New(NULL));
+  }
   if (!msyqlQueryResultInternalDoneGetter(mysqlQueryResult)->IsTrue()) {
     msyqlQueryResultInternalDoneSetter(mysqlQueryResult, TRUE);
   }
+  cleanupMysqlQueryResult(mysqlQueryResult);
   object.Dispose();
 }
 
@@ -573,7 +591,62 @@ void mysqlQueryResultFetch(v8::Handle<v8::Object> mysqlQueryResult) {
   msyqlQueryInternalDoneSetter(mysqlQuery, more_results == 0 ? v8::True() : v8::False());
 }
 
-v8::Handle<v8::Value> mysqlQueryResultFetchArray(const v8::Arguments& args) {
+v8::Handle<v8::Value> mysqlQueryResultField(const v8::Arguments& args) {
+  v8::Local<v8::Object> mysqlQueryResult = args.Holder()->ToObject();
+  MYSQL_RES *mysql_res = mysqlQueryResultInternalMysqlResGetter(mysqlQueryResult);
+  if (mysql_res == NULL) {
+    v8::ThrowException(v8::Exception::Error(v8::String::New("Result already exhausted")));
+    return v8::Null();
+  }
+
+  MYSQL_FIELD *field = NULL;
+  switch (args.Length()) {
+    case 0: //no argument passed, get the next field.
+      field = mysql_fetch_field(mysql_res);
+      break;
+    case 1: //argument passed.
+      if (args[0]->IsUint32()) {
+        v8::Local<v8::Uint32> uint = args[0]->ToUint32();
+        unsigned long index = uint->Value();
+        unsigned int fieldcount = mysql_num_fields(mysql_res);
+        if (index < 0 || index > fieldcount) {
+          v8::ThrowException(v8::Exception::Error(v8::String::New("Field index out of range")));
+          return v8::Null();
+        }
+        field = mysql_fetch_field_direct(mysql_res, index);
+      }
+      else {
+        v8::ThrowException(v8::Exception::Error(v8::String::New("Argument should be an unsigned integer")));
+        return v8::Null();
+      }
+      break;
+    default:
+      v8::ThrowException(v8::Exception::Error(v8::String::New("Expect at most 1 argument")));
+      return v8::Null();
+  }
+  if (field == NULL) return v8::Null();
+  v8::Local<v8::Object> mysqlQueryField = v8::Object::New();
+  mysqlQueryField->Set(str_name, v8::String::New(field->name));
+  mysqlQueryField->Set(str_org_name, v8::String::New(field->org_name));
+  mysqlQueryField->Set(str_table, v8::String::New(field->table));
+  mysqlQueryField->Set(str_org_table, v8::String::New(field->org_table));
+  mysqlQueryField->Set(str_schema, v8::String::New(field->db));
+  mysqlQueryField->Set(str_decimals, v8::Uint32::New(field->decimals));
+  mysqlQueryField->Set(str_length, v8::Uint32::New(field->length));
+  mysqlQueryField->Set(str_max_length, v8::Uint32::New(field->max_length));
+  mysqlQueryField->Set(str_maybe_null, field->flags & NOT_NULL_FLAG ? v8::False() : v8::True());
+  mysqlQueryField->Set(str_primary_key, field->flags & PRI_KEY_FLAG ? v8::True() : v8::False());
+  mysqlQueryField->Set(str_unique_key, field->flags & UNIQUE_KEY_FLAG ? v8::True() : v8::False());
+  mysqlQueryField->Set(str_multiple_key, field->flags & MULTIPLE_KEY_FLAG ? v8::True() : v8::False());
+  mysqlQueryField->Set(str_unsigned, field->flags & UNSIGNED_FLAG ? v8::True() : v8::False());
+  mysqlQueryField->Set(str_zerofill, field->flags & ZEROFILL_FLAG ? v8::True() : v8::False());
+  mysqlQueryField->Set(str_binary, field->flags & BINARY_FLAG ? v8::True() : v8::False());
+  mysqlQueryField->Set(str_auto_increment, field->flags & AUTO_INCREMENT_FLAG ? v8::True() : v8::False());
+  mysqlQueryField->Set(str_numeric, field->flags & NUM_FLAG ? v8::True() : v8::False());
+  return mysqlQueryField;
+}
+
+v8::Handle<v8::Value> mysqlQueryResultRow(const v8::Arguments& args) {
   LOG_ERR("Fetch");
   v8::Local<v8::Object> mysqlQueryResult = args.Holder()->ToObject();
   //get the "done" field
@@ -581,14 +654,19 @@ v8::Handle<v8::Value> mysqlQueryResultFetchArray(const v8::Arguments& args) {
     //v8::ThrowException(v8::Exception::Error(v8::String::New("Result already exhausted")));
     return v8::Null();
   }
-  v8::Local<v8::Array> array;
+  v8::Local<v8::Object> row;
   switch (args.Length()) {
-    case 0: //no array was passed, create a new one.
-      array = v8::Array::New();
+    case 0: //no argument passed, create a new one.
+      row = v8::Array::New();
       break;
     case 1: //argument passed.
-      if (args[0]->IsArray()) array = v8::Local<v8::Array>::Cast(args[0]);
-      else v8::ThrowException(v8::Exception::Error(v8::String::New("Argument should be an array")));
+      if (args[0]->IsArray()) row = v8::Local<v8::Array>::Cast(args[0]);
+      else
+      if (args[0]->IsObject()) row = v8::Local<v8::Object>::Cast(args[0]);
+      else {
+        v8::ThrowException(v8::Exception::Error(v8::String::New("Argument should be either an array or an object")));
+        return v8::Null();
+      }
       break;
     default:
       v8::ThrowException(v8::Exception::Error(v8::String::New("Expect at most 1 argument")));
@@ -603,14 +681,21 @@ v8::Handle<v8::Value> mysqlQueryResultFetchArray(const v8::Arguments& args) {
   unsigned int i, fieldcount = mysql_num_fields(mysql_res);
   unsigned long *lengths = mysql_fetch_lengths(mysql_res);
   FIELD_EXTRACTOR *field_extractors = mysqlQueryResultInternalExtractorsGetter(mysqlQueryResult);
-  for (i = 0; i < fieldcount; i++) {
-    array->Set(i, field_extractors[i](mysql_row[i], lengths[i]));
+  if (row->IsArray()) {
+    for (i = 0; i < fieldcount; i++) {
+      row->Set(i, field_extractors[i](mysql_row[i], lengths[i]));
+    }
   }
-
+  else {
+    MYSQL_FIELD* fields = mysql_fetch_fields(mysql_res);
+    for (i = 0; i < fieldcount; i++) {
+      row->Set(v8::String::New(fields[i].name), field_extractors[i](mysql_row[i], lengths[i]));
+    }
+  }
   //fetch the next row. This automatically sets the done flag.
   mysqlQueryResultFetch(mysqlQueryResult);
   LOG_ERR("Fetch ready.");
-  return array;
+  return row;
 }
 
 v8::Persistent<v8::ObjectTemplate> createMysqlQueryResultTemplate(){
@@ -620,7 +705,8 @@ v8::Persistent<v8::ObjectTemplate> createMysqlQueryResultTemplate(){
   _mysqlQueryResultTemplate->SetInternalFieldCount(6);
   _mysqlQueryResultTemplate->SetAccessor(v8::String::New("done"), mysqlQueryResultDoneGetter, mysqlQueryResultDoneSetter);
   _mysqlQueryResultTemplate->SetAccessor(v8::String::New("buffered"), mysqlQueryResultBufferedGetter, setConstant);
-  _mysqlQueryResultTemplate->Set(v8::String::New("fetchArray"), v8::FunctionTemplate::New(mysqlQueryResultFetchArray));
+  _mysqlQueryResultTemplate->Set(v8::String::New("field"), v8::FunctionTemplate::New(mysqlQueryResultField));
+  _mysqlQueryResultTemplate->Set(v8::String::New("row"), v8::FunctionTemplate::New(mysqlQueryResultRow));
   return v8::Persistent<v8::ObjectTemplate>::New(_mysqlQueryResultTemplate);
 }
 
@@ -2055,6 +2141,19 @@ static int js_daemon_plugin_init(MYSQL_PLUGIN){
   str_type = v8::Persistent<v8::String>::New(v8::String::New("type"));
   str_value = v8::Persistent<v8::String>::New(v8::String::New("value"));
 
+  str_org_name = v8::Persistent<v8::String>::New(v8::String::New("originalName"));
+  str_table = v8::Persistent<v8::String>::New(v8::String::New("table"));
+  str_org_table = v8::Persistent<v8::String>::New(v8::String::New("originalTable"));
+  str_length = v8::Persistent<v8::String>::New(v8::String::New("displayLength"));
+  str_primary_key = v8::Persistent<v8::String>::New(v8::String::New("primaryKey"));
+  str_unique_key = v8::Persistent<v8::String>::New(v8::String::New("uniqueKey"));
+  str_multiple_key = v8::Persistent<v8::String>::New(v8::String::New("multipleKey"));
+  str_unsigned = v8::Persistent<v8::String>::New(v8::String::New("unsigned"));
+  str_zerofill = v8::Persistent<v8::String>::New(v8::String::New("zerofill"));
+  str_binary = v8::Persistent<v8::String>::New(v8::String::New("binary"));
+  str_auto_increment = v8::Persistent<v8::String>::New(v8::String::New("autoIncrement"));
+  str_numeric = v8::Persistent<v8::String>::New(v8::String::New("numeric"));
+
   str_host = v8::Persistent<v8::String>::New(v8::String::New("host"));
   str_user = v8::Persistent<v8::String>::New(v8::String::New("user"));
   str_password = v8::Persistent<v8::String>::New(v8::String::New("password"));
@@ -2106,6 +2205,19 @@ static int js_daemon_plugin_deinit(MYSQL_PLUGIN){
   str_name.Dispose();
   str_type.Dispose();
   str_value.Dispose();
+
+  str_org_name.Dispose();
+  str_table.Dispose();
+  str_org_table.Dispose();
+  str_length.Dispose();
+  str_primary_key.Dispose();
+  str_unique_key.Dispose();
+  str_multiple_key.Dispose();
+  str_unsigned.Dispose();
+  str_zerofill.Dispose();
+  str_binary.Dispose();
+  str_auto_increment.Dispose();
+  str_numeric.Dispose();
 
   str_host.Dispose();
   str_schema.Dispose();
