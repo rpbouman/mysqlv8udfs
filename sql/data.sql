@@ -117,7 +117,17 @@ var y = parseInt(arguments[0].substr(0,4), 10),
     return count;
   }
 ', 'JS equivalent of COUNT(DISTINCT )')
-,('json_export', 'jsagg', '
+,('json_row', 'jsudf', '
+  function udf(){
+    var i, arg, args = this.arguments, n = args.length, row = {};
+    for (i = 0; i < n;  i++) {
+      arg = args[i];
+      row[arg.name] = arg.value;
+    }
+    return JSON.stringify(row, null, "");
+  }
+', 'Export arguments as a JSON object.')
+,('json_rows', 'jsagg', '
   var rows;
   function clear() {
     rows = [];
@@ -133,7 +143,7 @@ var y = parseInt(arguments[0].substr(0,4), 10),
   function agg(){
     return JSON.stringify({cols: this.arguments, rows: rows}, null, 2);
   }
-', 'Export data as JSON')
+', 'Export resultset as a JSON object.')
 ,('group_concat', 'jsagg', '
   var values;
   function clear(){

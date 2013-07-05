@@ -1,3 +1,5 @@
+#include "stdio.h"
+#include "time.h"
 #include "stdlib.h"
 #include "string.h"
 #include "stdarg.h"
@@ -23,6 +25,10 @@
 unsigned long JS_INITIAL_RETURN_VALUE_LENGTH  = 255;
 
 #define JS_DAEMON_VERSION               "0.0.1";
+#define PLUGIN_NAME                     "JS_DAEMON"
+#define LOG_LEVEL_ERROR                 "error"
+#define LOG_LEVEL_INFO                  "info"
+#define LOG_LEVEL_WARN                  "warn"
 
 #define MSG_MISSING_SCRIPT              "Missing script argument."
 #define MSG_SCRIPT_MUST_BE_STRING       "Script argument must be a string."
@@ -78,6 +84,7 @@ unsigned long JS_INITIAL_RETURN_VALUE_LENGTH  = 255;
 
 
 static v8::Persistent<v8::ObjectTemplate> globalTemplate;
+static v8::Persistent<v8::ObjectTemplate> consoleTemplate;
 static v8::Persistent<v8::ObjectTemplate> mysqlTemplate;
 static v8::Persistent<v8::ObjectTemplate> mysqlClientTemplate;
 static v8::Persistent<v8::ObjectTemplate> mysqlConnectionTemplate;
@@ -1549,22 +1556,14 @@ v8::Persistent<v8::ObjectTemplate> createMysqlTemplate(){
   mysqlTypes->Set(MYSQL_TYPE_ENUM, v8::String::New("enum"));
   mysqlTypes->Set(MYSQL_TYPE_GEOMETRY, v8::String::New("geometry"));
   mysqlTypes->Set(MYSQL_TYPE_NULL, v8::String::New("null"));
-  _mysqlTemplate->Set(v8::String::New("types"), mysqlTypes);
+  _mysqlTemplate->Set(v8::String::New("column_types"), mysqlTypes);
   return v8::Persistent<v8::ObjectTemplate>::New(_mysqlTemplate);
 }
 
 /**
  *  Global Object
  */
-v8::Persistent<v8::ObjectTemplate> createGlobalTemplate(){
-  v8::Handle<v8::ObjectTemplate> _template = v8::ObjectTemplate::New();
-  //internal field is used to bind UDF_INIT pointer.
-  _template->SetInternalFieldCount(1);
-  _template->Set(v8::String::New("mysql"), mysqlTemplate->NewInstance());
-  return v8::Persistent<v8::ObjectTemplate>::New(_template);
-}
-
-/**
+ /**
  *
  *  Wrapping useful udf constants
  *
@@ -1593,13 +1592,81 @@ v8::Handle<v8::Value> getNotFixedDecConstant(v8::Local<v8::String> property, con
   return v8::Uint32::New(NOT_FIXED_DEC);
 }
 
-void add_udf_constants(v8::Local<v8::Object> object){
-  object->SetAccessor(str_STRING_RESULT, getStringResultConstant, setConstant);
-  object->SetAccessor(str_REAL_RESULT, getRealResultConstant, setConstant);
-  object->SetAccessor(str_INT_RESULT, getIntResultConstant, setConstant);
-  object->SetAccessor(str_ROW_RESULT, getRowResultConstant, setConstant);
-  object->SetAccessor(str_DECIMAL_RESULT, getDecimalResultConstant, setConstant);
-  object->SetAccessor(str_NOT_FIXED_DEC, getNotFixedDecConstant, setConstant);
+v8::Persistent<v8::ObjectTemplate> createGlobalTemplate(){
+  v8::Handle<v8::ObjectTemplate> _template = v8::ObjectTemplate::New();
+  _template->SetInternalFieldCount(1);
+  _template->SetAccessor(str_STRING_RESULT, getStringResultConstant, setConstant);
+  _template->SetAccessor(str_REAL_RESULT, getRealResultConstant, setConstant);
+  _template->SetAccessor(str_INT_RESULT, getIntResultConstant, setConstant);
+  _template->SetAccessor(str_ROW_RESULT, getRowResultConstant, setConstant);
+  _template->SetAccessor(str_DECIMAL_RESULT, getDecimalResultConstant, setConstant);
+  _template->SetAccessor(str_NOT_FIXED_DEC, getNotFixedDecConstant, setConstant);
+  _template->Set(v8::String::New("mysql"), mysqlTemplate->NewInstance());
+  _template->Set(v8::String::New("console"), consoleTemplate->NewInstance());
+  return v8::Persistent<v8::ObjectTemplate>::New(_template);
+}
+
+v8::Handle<v8::Value> log(const char *kind, const v8::Arguments& args){
+  if (kind != NULL) {
+    time_t timer;
+    time(&timer);
+    struct tm *timeinfo;
+    timeinfo = localtime(&timer);
+
+    fprintf(stderr, "%i-%s%i-%s%i %s%i:%s%i:%s%i %s [%s]: ",
+      1900+timeinfo->tm_year,
+      timeinfo->tm_mon  <  9 ? "0" : "",
+      1+timeinfo->tm_mon,
+      timeinfo->tm_mday < 10 ? "0" : "",
+      timeinfo->tm_mday,
+      timeinfo->tm_hour < 10 ? "0" : "",
+      timeinfo->tm_hour,
+      timeinfo->tm_min  < 10 ? "0" : "",
+      timeinfo->tm_min,
+      timeinfo->tm_sec  < 10 ? "0" : "",
+      timeinfo->tm_sec,
+      PLUGIN_NAME,
+      kind
+    );
+  }
+
+  unsigned long argc = args.Length();
+  unsigned long i;
+  v8::Local<v8::String> arg;
+  for (i = 0; i < argc; i++) {
+    arg = args[i]->ToString();
+    v8::String::AsciiValue ascii(arg);
+    fprintf(stderr, "%s", *ascii);
+  }
+  fprintf(stderr, "%s", "\n");
+  return v8::Null();
+}
+
+v8::Handle<v8::Value> consoleError(const v8::Arguments& args) {
+  return log(LOG_LEVEL_ERROR, args);
+}
+
+v8::Handle<v8::Value> consoleWarn(const v8::Arguments& args) {
+  return log(LOG_LEVEL_WARN, args);
+}
+
+v8::Handle<v8::Value> consoleInfo(const v8::Arguments& args) {
+  return log(LOG_LEVEL_INFO, args);
+}
+
+v8::Handle<v8::Value> consoleLog(const v8::Arguments& args) {
+  return log(NULL, args);
+}
+/**
+ *  Console Object
+ */
+v8::Persistent<v8::ObjectTemplate> createConsoleTemplate(){
+  v8::Handle<v8::ObjectTemplate> _consoleTemplate = v8::ObjectTemplate::New();
+  _consoleTemplate->Set(v8::String::New(LOG_LEVEL_ERROR), v8::FunctionTemplate::New(consoleError));
+  _consoleTemplate->Set(v8::String::New(LOG_LEVEL_INFO), v8::FunctionTemplate::New(consoleInfo));
+  _consoleTemplate->Set(v8::String::New(LOG_LEVEL_WARN), v8::FunctionTemplate::New(consoleWarn));
+  _consoleTemplate->Set(v8::String::New("log"), v8::FunctionTemplate::New(consoleLog));
+  return v8::Persistent<v8::ObjectTemplate>::New(_consoleTemplate);
 }
 
 /**
@@ -1695,7 +1762,7 @@ int status_var_v8_heap_size_total(MYSQL_THD thd, struct st_mysql_show_var *var, 
 int status_var_v8_heap_size_total_executable(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
   var->type = SHOW_INT;
   updateHeapStatistics();
-  *buff = (int)js_daemon_heap_statistics->total_heap_size();
+  *buff = (int)js_daemon_heap_statistics->total_heap_size_executable();
   var->value = buff;
   return 0;
 }
@@ -1790,7 +1857,6 @@ my_bool js_alloc_resources(UDF_INIT *initid, UDF_ARGS *args, char *message) {
     strcpy(message, MSG_RESULT_ALLOCATION_FAILED);
     return INIT_ERROR;
   }
-
   return INIT_SUCCESS;
 }
 
@@ -1916,7 +1982,6 @@ my_bool jsudf_init(UDF_INIT *initid, UDF_ARGS *args, char *message){
   //that has the internal field that we need to interface with initid.
   add_udf_init_accessors(global->GetPrototype()->ToObject(), initid);
 
-  add_udf_constants(global);
   //setup argument objects
   if (setupArgumentObjects(v8res, args, message) == INIT_ERROR) {
     v8res->context->Exit();
@@ -2377,6 +2442,7 @@ static int js_daemon_plugin_init(MYSQL_PLUGIN){
   mysqlClientTemplate = createMysqlClientTemplate();
   mysqlTemplate = createMysqlTemplate();
 
+  consoleTemplate = createConsoleTemplate();
   globalTemplate = createGlobalTemplate();
 
   jsDaemonContext->Exit();
@@ -2392,6 +2458,7 @@ static int js_daemon_plugin_deinit(MYSQL_PLUGIN){
   jsDaemonContext->Enter();
 
   globalTemplate.Dispose();
+  consoleTemplate.Dispose();
 
   mysqlTemplate.Dispose();
   mysqlClientTemplate.Dispose();
@@ -2500,9 +2567,9 @@ mysql_declare_plugin(js_daemon)
 {
   MYSQL_DAEMON_PLUGIN,
   &js_daemon_info,
-  "js_daemon",
+  PLUGIN_NAME,
   "Roland Bouman",
-  "Javascript Daemon - Manages resources for the js* UDFs.",
+  "Javascript Daemon - Manages resources for the js* UDFs - https://github.com/rpbouman/mysqlv8udfs",
   PLUGIN_LICENSE_GPL,
   js_daemon_plugin_init,      /* Plugin Init */
   js_daemon_plugin_deinit,    /* Plugin Deinit */
