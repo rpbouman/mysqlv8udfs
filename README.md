@@ -3,11 +3,19 @@ mysqlv8udfs
 
 MySQL UDFs to work with the Google v8 javascript engine
 
+This project provides the code for a MySQL server plugin and a number of MySQL User-defined functions (UDFs) that expose Google's v8 javascript engine in MySQL queries and stored routines.
+Here's a summary of what it provides:
+* UDF js(script[, arg1, ..., argN]) - execute a snippet of js and return the value.
+* UDF jsudf(script[, arg1, ..., argN]) - exposes MySQL's native UDF interface to the javascript environment.
+* UDF jsagg(script[, arg1, ..., argN]) - exposes MySQL's native UDF interface for aggregate functions to the javascript environment. 
+
+In addition, a built-in mysql client API is provided that let's you run MySQL commands and consume results - in Javascript! 
+
 How to build
 ------------
 This is the line that works for me:
 
-    g++ -Wall -I include -I ~/mysql/mysql/include -shared -fPIC -o mysqlv8udfs.so mysqlv8udfs.cpp /usr/lib/libv8.so
+    g++ -Wall -I include -I /home/rbouman/mysql/mysql/include -shared -fPIC -DMYSQL_DYNAMIC_PLUGIN -o mysqlv8udfs.so mysqlv8udfs.cpp /usr/lib/libv8.so ~/mysql/mysql/lib/libmysqlclient.so
 
 (I'm on KUbuntu 12.10, and I installed mysql 5.6 in ~/mysql/mysql. I also installed the g++ and libv8-dev packages using Ubuntu Software Center)
 
@@ -149,5 +157,4 @@ Here's a simple example that implements COUNT(*) as a javascript function:
        -'>   }
        -'> ') from sakila.category;
 
-Here's another example that exports rows as an array of objects using JSON:
 
