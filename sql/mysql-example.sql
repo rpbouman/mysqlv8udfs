@@ -1,3 +1,26 @@
+select js(
+  'JSON.stringify(arguments, null, " ")'
+, 'String'
+, RAND()
+, 1
+, PI()
+, CAST(PI() as DECIMAL(5,4))
+, NULL
+);
+
+select jsudf('
+  function udf(){
+    return JSON.stringify(this.arguments, null, " ");
+  }'
+, 'String'
+, RAND()
+, 1
+, PI()
+, CAST(PI() as DECIMAL(5,4))
+, NULL
+);
+
+
 -- prepare example
 select jsudf('
  var connection;
