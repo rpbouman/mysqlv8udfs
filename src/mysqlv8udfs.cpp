@@ -108,12 +108,20 @@ static v8::Persistent<v8::String> str_max_length;
 static v8::Persistent<v8::String> str_name;
 static v8::Persistent<v8::String> str_type;
 static v8::Persistent<v8::String> str_value;
+
 static v8::Persistent<v8::String> str_STRING_RESULT;
 static v8::Persistent<v8::String> str_INT_RESULT;
 static v8::Persistent<v8::String> str_DECIMAL_RESULT;
 static v8::Persistent<v8::String> str_REAL_RESULT;
 static v8::Persistent<v8::String> str_ROW_RESULT;
 static v8::Persistent<v8::String> str_NOT_FIXED_DEC;
+
+static v8::Persistent<v8::Integer> int_STRING_RESULT;
+static v8::Persistent<v8::Integer> int_INT_RESULT;
+static v8::Persistent<v8::Integer> int_DECIMAL_RESULT;
+static v8::Persistent<v8::Integer> int_REAL_RESULT;
+static v8::Persistent<v8::Integer> int_ROW_RESULT;
+static v8::Persistent<v8::Integer> int_NOT_FIXED_DEC;
 
 static v8::Persistent<v8::String> str_charsetnr;
 static v8::Persistent<v8::String> str_org_name;
@@ -272,6 +280,7 @@ my_bool setupArguments(V8RES *v8res, UDF_ARGS* args, char *message, my_bool argu
   }
   v8res->context->Global()->Set(str_arguments, arguments);
   v8res->arguments = v8::Persistent<v8::Array>::New(arguments);
+  v8::Persistent<v8::Integer> int_type;
   for (unsigned int i = 1; i < args->arg_count; i++) {
     //for each argument, find a suitable extractor.
     //(the extractor translates value from mysql to v8 land)
@@ -282,9 +291,11 @@ my_bool setupArguments(V8RES *v8res, UDF_ARGS* args, char *message, my_bool argu
         args->arg_type[i] = STRING_RESULT;
       case STRING_RESULT:
         arg_extractor = getStringArgValue;
+        int_type = int_STRING_RESULT;
         break;
       case INT_RESULT:
         arg_extractor = getIntArgValue;
+        int_type = int_INT_RESULT;
         break;
       case DECIMAL_RESULT:
         //explicitly coerce decimals into reals.
@@ -297,6 +308,7 @@ my_bool setupArguments(V8RES *v8res, UDF_ARGS* args, char *message, my_bool argu
         //mark as was decimal in case we need to get the value.
         was_decimal = TRUE;
       case REAL_RESULT:
+        int_type = was_decimal ? int_DECIMAL_RESULT : int_REAL_RESULT;
         arg_extractor = getRealArgValue;
         break;
     }
@@ -324,7 +336,7 @@ my_bool setupArguments(V8RES *v8res, UDF_ARGS* args, char *message, my_bool argu
     if (argumentObjects == TRUE) {
       v8::Local<v8::Object> argumentObject = v8::Object::New();
       argumentObject->Set(str_name, v8::String::New(args->attributes[i], args->attribute_lengths[i]));
-      argumentObject->Set(str_type, was_decimal ? v8::Uint32::New(DECIMAL_RESULT) : v8::Uint32::New(args->arg_type[i]));
+      argumentObject->Set(str_type, int_type);
       argumentObject->Set(str_max_length, v8::Number::New((double)args->lengths[i]));
       argumentObject->Set(str_maybe_null, args->maybe_null[i] == TRUE ? v8::True() : v8::False());
       //determine if this is a constant item
@@ -1560,27 +1572,27 @@ v8::Persistent<v8::ObjectTemplate> createMysqlTemplate(){
  *
  */
 v8::Handle<v8::Value> getStringResultConstant(v8::Local<v8::String> property, const v8::AccessorInfo& info){
-  return v8::Uint32::New(STRING_RESULT);
+  return int_STRING_RESULT;
 }
 
 v8::Handle<v8::Value> getRealResultConstant(v8::Local<v8::String> property, const v8::AccessorInfo& info){
-  return v8::Uint32::New(REAL_RESULT);
+  return int_REAL_RESULT;
 }
 
 v8::Handle<v8::Value> getIntResultConstant(v8::Local<v8::String> property, const v8::AccessorInfo& info){
-  return v8::Uint32::New(INT_RESULT);
+  return int_INT_RESULT;
 }
 
 v8::Handle<v8::Value> getRowResultConstant(v8::Local<v8::String> property, const v8::AccessorInfo& info){
-  return v8::Uint32::New(ROW_RESULT);
+  return int_ROW_RESULT;
 }
 
 v8::Handle<v8::Value> getDecimalResultConstant(v8::Local<v8::String> property, const v8::AccessorInfo& info){
-  return v8::Uint32::New(DECIMAL_RESULT);
+  return int_DECIMAL_RESULT;
 }
 
 v8::Handle<v8::Value> getNotFixedDecConstant(v8::Local<v8::String> property, const v8::AccessorInfo& info){
-  return v8::Uint32::New(NOT_FIXED_DEC);
+  return int_NOT_FIXED_DEC;
 }
 
 v8::Persistent<v8::ObjectTemplate> createGlobalTemplate(){
@@ -2368,6 +2380,14 @@ static int js_daemon_plugin_init(MYSQL_PLUGIN){
   str_DECIMAL_RESULT = v8::Persistent<v8::String>::New(v8::String::New("DECIMAL_RESULT"));
   str_NOT_FIXED_DEC = v8::Persistent<v8::String>::New(v8::String::New("NOT_FIXED_DEC"));
 
+  int_STRING_RESULT = v8::Persistent<v8::Integer>::New(v8::Uint32::New(STRING_RESULT));
+  int_INT_RESULT = v8::Persistent<v8::Integer>::New(v8::Uint32::New(INT_RESULT));
+  int_DECIMAL_RESULT = v8::Persistent<v8::Integer>::New(v8::Uint32::New(DECIMAL_RESULT));
+  int_REAL_RESULT = v8::Persistent<v8::Integer>::New(v8::Uint32::New(REAL_RESULT));
+  int_ROW_RESULT = v8::Persistent<v8::Integer>::New(v8::Uint32::New(ROW_RESULT));
+  int_DECIMAL_RESULT = v8::Persistent<v8::Integer>::New(v8::Uint32::New(DECIMAL_RESULT));
+  int_NOT_FIXED_DEC = v8::Persistent<v8::Integer>::New(v8::Uint32::New(NOT_FIXED_DEC));
+
   str_arguments = v8::Persistent<v8::String>::New(v8::String::New("arguments"));
   str_const_item = v8::Persistent<v8::String>::New(v8::String::New("const_item"));
   str_decimals = v8::Persistent<v8::String>::New(v8::String::New("decimals"));
@@ -2489,6 +2509,14 @@ static int js_daemon_plugin_deinit(MYSQL_PLUGIN){
   str_ROW_RESULT.Dispose();
   str_DECIMAL_RESULT.Dispose();
   str_NOT_FIXED_DEC.Dispose();
+
+  int_STRING_RESULT.Dispose();
+  int_INT_RESULT.Dispose();
+  int_DECIMAL_RESULT.Dispose();
+  int_REAL_RESULT.Dispose();
+  int_ROW_RESULT.Dispose();
+  int_DECIMAL_RESULT.Dispose();
+  int_NOT_FIXED_DEC.Dispose();
 
   str_arguments.Dispose();
   str_const_item.Dispose();
