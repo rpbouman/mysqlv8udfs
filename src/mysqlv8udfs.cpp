@@ -520,11 +520,12 @@ MYSQL *getMySQLConnectionInternal(v8::Handle<v8::Object> holder, my_bool throwIf
   return mysql;
 }
 
+v8::Handle<v8::Value> mysqlConnectionInternalConnectedGetter(v8::Handle<v8::Object> mysqlConnection);
 void weakMysqlConnectionCallback(v8::Persistent<v8::Value> object, void* _mysql) {
-  LOG_ERR("Cleaning up weak mysql client...");
-  //TODO: clean up the connection.
-  MYSQL *mysql = (MYSQL *)_mysql;
-  if (mysql != NULL) {
+  v8::HandleScope handle_scope;
+  v8::Local<v8::Object> _object = object->ToObject();
+  if (mysqlConnectionInternalConnectedGetter(_object)->IsTrue()) {
+    MYSQL *mysql = getMySQLConnectionInternal(_object);
     mysql_close(mysql);
   }
   object.Dispose();
@@ -1300,18 +1301,23 @@ v8::Handle<v8::Value> createMysqlQuery(const v8::Arguments& args) {
  *  MySQL bindings: Connection
  *
  */
+v8::Handle<v8::Value> mysqlConnectionInternalConnectedGetter(v8::Handle<v8::Object> mysqlConnection){
+  return mysqlConnection->GetInternalField(1);
+}
+
+v8::Handle<v8::Value> mysqlConnectionConnectedGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info) {
+  return mysqlConnectionInternalConnectedGetter(info.Holder());
+}
+
 v8::Handle<v8::Value> mysqlConnectionClose(const v8::Arguments& args) {
   v8::Local<v8::Object> holder = args.Holder();
+  if (mysqlConnectionInternalConnectedGetter(holder)->IsFalse()) return v8::False();
   MYSQL *mysql = getMySQLConnectionInternal(holder, FALSE);
   if (mysql == NULL) return v8::False();
   mysql_close(mysql);
   holder->SetInternalField(0, v8::External::New(NULL));
+  holder->SetInternalField(1, v8::False());
   return v8::True();
-}
-
-v8::Handle<v8::Value> mysqlConnectionConnectedGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info) {
-  MYSQL *mysql = getMySQLConnectionInternal(info.Holder(), FALSE);
-  return (mysql == NULL) ? v8::False() : v8::True();
 }
 
 v8::Handle<v8::Value> mysqlConnectionCommit(const v8::Arguments& args) {
@@ -1326,6 +1332,20 @@ v8::Handle<v8::Value> mysqlConnectionCommit(const v8::Arguments& args) {
 v8::Handle<v8::Value> mysqlConnectionRollback(const v8::Arguments& args) {
   MYSQL *mysql = getMySQLConnectionInternal(args.Holder());
   if (mysql_rollback(mysql)) {
+    throwMysqlClientException(args.Holder());
+    return v8::Null();
+  }
+  return v8::True();
+}
+
+v8::Handle<v8::Value> mysqlConnectionSetAutocommit(const v8::Arguments& args) {
+  if (args.Length() != 1) {
+    throwError(str_expected_one_argument);
+    return v8::False();
+  }
+  my_bool mode = args[0]->IsTrue() ? TRUE : FALSE;
+  MYSQL *mysql = getMySQLConnectionInternal(args.Holder());
+  if (mysql_autocommit(mysql, mode)) {
     throwMysqlClientException(args.Holder());
     return v8::Null();
   }
@@ -1392,8 +1412,10 @@ void mysqlConnectionCharsetSetter(v8::Local<v8::String> property, v8::Local<v8::
 
 v8::Persistent<v8::ObjectTemplate> createMysqlConnectionTemplate(){
   v8::Handle<v8::ObjectTemplate> _mysqlConnectionTemplate = v8::ObjectTemplate::New();
-  _mysqlConnectionTemplate->SetInternalFieldCount(1);
+  //first field is MYSQL * pointer, second field is closed flag.
+  _mysqlConnectionTemplate->SetInternalFieldCount(2);
   _mysqlConnectionTemplate->Set(v8::String::New("close"), v8::FunctionTemplate::New(mysqlConnectionClose));
+  _mysqlConnectionTemplate->Set(v8::String::New("setAutoCommit"), v8::FunctionTemplate::New(mysqlConnectionSetAutocommit));
   _mysqlConnectionTemplate->Set(v8::String::New("commit"), v8::FunctionTemplate::New(mysqlConnectionCommit));
   _mysqlConnectionTemplate->Set(v8::String::New("rollback"), v8::FunctionTemplate::New(mysqlConnectionRollback));
   _mysqlConnectionTemplate->Set(v8::String::New("query"), v8::FunctionTemplate::New(createMysqlQuery));
@@ -1407,7 +1429,7 @@ v8::Persistent<v8::ObjectTemplate> createMysqlConnectionTemplate(){
   _mysqlConnectionTemplate->SetAccessor(v8::String::New("insertId"), mysqlConnectionInsertIdGetter, setConstant);
   _mysqlConnectionTemplate->SetAccessor(v8::String::New("protocolVersion"),  mysqlConnectionProtocolInfoGetter, setConstant);
   _mysqlConnectionTemplate->SetAccessor(v8::String::New("serverVersion"), mysqlConnectionServerInfoGetter, setConstant);
-  _mysqlConnectionTemplate->SetAccessor(v8::String::New("stat"), mysqlConnectionStatGetter, setConstant);
+  _mysqlConnectionTemplate->SetAccessor(v8::String::New("statistics"), mysqlConnectionStatGetter, setConstant);
   _mysqlConnectionTemplate->SetAccessor(v8::String::New("warnings"), mysqlConnectionWarningsGetter, setConstant);
   return v8::Persistent<v8::ObjectTemplate>::New(_mysqlConnectionTemplate);
 }
@@ -1512,6 +1534,8 @@ v8::Handle<v8::Value> mysqlClientConnect(const v8::Arguments& args) {
 
   v8::Local<v8::Object> mysqlConnection = mysqlConnectionTemplate->NewInstance();
   mysqlConnection->SetInternalField(0, v8::External::New(mysql));
+  //connected flag.
+  mysqlConnection->SetInternalField(1, v8::True());
 
   v8::Persistent<v8::Object> persistentMysqlConnection = v8::Persistent<v8::Object>::New(mysqlConnection);
   persistentMysqlConnection.MakeWeak(mysql, weakMysqlConnectionCallback);
