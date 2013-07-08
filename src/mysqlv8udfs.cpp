@@ -57,11 +57,13 @@ unsigned long JS_INITIAL_RETURN_VALUE_LENGTH  = 255;
 #define MSG_FIELD_INDEX_MUST_BE_INT     "Field index argument should be an unsigned integer"
 #define MSG_EXPECTED_ZERO_ARGUMENTS     "No arguments allowed"
 #define MSG_EXPECTED_ONE_ARGUMENT       "Expect at most 1 argument"
-#define MSG_ARG_MUST_BE_ARRAY_OR_OBJECT "Argument must be either an array or an object"
+#define MSG_ARG_MUST_BE_ARRAY_OR_OBJECT_OR_FUNCTION "Argument must be either an array or an object or a function"
 #define MSG_ARG_MUST_BE_STRING          "Argument must be a string"
 #define MSG_ARG_MUST_BE_OBJECT          "Argument must be an object"
 #define MSG_ARG_MUST_BE_ARRAY           "Argument must be an array"
 #define MSG_ARG_MUST_BE_BOOLEAN         "Argument must be a boolean"
+#define MSG_FIRST_ARG_MUST_BE_FUNCTION  "First argument must be a function"
+#define MSG_SECOND_ARG_MUST_BE_OBJECT   "Second argument must be an object"
 #define MSG_HOST_MUST_BE_STRING         "Host must be a string"
 #define MSG_USER_MUST_BE_STRING         "User must be a string"
 #define MSG_PASSWORD_MUST_BE_STRING     "Password must be a string"
@@ -170,11 +172,13 @@ static v8::Persistent<v8::String> str_field_index_out_of_range;
 static v8::Persistent<v8::String> str_field_index_must_be_int;
 static v8::Persistent<v8::String> str_expected_zero_arguments;
 static v8::Persistent<v8::String> str_expected_one_argument;
-static v8::Persistent<v8::String> str_arg_must_be_array_or_object;
+static v8::Persistent<v8::String> str_arg_must_be_array_or_object_or_function;
 static v8::Persistent<v8::String> str_arg_must_be_string;
 static v8::Persistent<v8::String> str_arg_must_be_object;
 static v8::Persistent<v8::String> str_arg_must_be_array;
 static v8::Persistent<v8::String> str_arg_must_be_boolean;
+static v8::Persistent<v8::String> str_first_arg_must_be_function;
+static v8::Persistent<v8::String> str_second_arg_must_be_object;
 static v8::Persistent<v8::String> str_host_must_be_string;
 static v8::Persistent<v8::String> str_user_must_be_string;
 static v8::Persistent<v8::String> str_password_must_be_string;
@@ -801,14 +805,29 @@ v8::Handle<v8::Value> mysqlQueryResultSetRow(const v8::Arguments& args) {
       LOG_ERR("1 argument");
       if (args[0]->IsArray()) row = v8::Local<v8::Array>::Cast(args[0]);
       else
-      if (args[0]->IsFunction()) break;
+      if (args[0]->IsFunction()) {
+        row = mysqlQueryResultSet;
+      }
       else
       if (args[0]->IsObject()) row = v8::Local<v8::Object>::Cast(args[0]);
       else {
         LOG_ERR("Argument type not supported");
-        throwError(str_arg_must_be_array_or_object);
+        throwError(str_arg_must_be_array_or_object_or_function);
         return v8::Null();
       }
+      break;
+    case 2:
+      if (!args[0]->IsFunction()) {
+        LOG_ERR("Argument type not supported");
+        throwError(str_first_arg_must_be_function);
+        return v8::Null();
+      }
+      if (!args[1]->IsObject()){
+        LOG_ERR("Argument type not supported");
+        throwError(str_second_arg_must_be_object);
+        return v8::Null();
+      }
+      row = args[1]->ToObject();
       break;
     default:
       LOG_ERR("invalid number of arguments");
@@ -834,7 +853,7 @@ v8::Handle<v8::Value> mysqlQueryResultSetRow(const v8::Arguments& args) {
     for (i = 0; i < fieldcount; i++) {
       _args[i] = field_extractors[i](mysql_row[i], lengths[i]);
     }
-    ret = callback->Call(mysqlQueryResultSet, fieldcount, _args);
+    ret = callback->Call(row, fieldcount, _args);
   }
   else
   if (row->IsArray()) {
@@ -2523,16 +2542,16 @@ static int js_daemon_plugin_init(MYSQL_PLUGIN){
   str_table = v8::Persistent<v8::String>::New(v8::String::New("table"));
   str_org_table = v8::Persistent<v8::String>::New(v8::String::New("org_table"));
   str_length = v8::Persistent<v8::String>::New(v8::String::New("length"));
-  str_primary_key = v8::Persistent<v8::String>::New(v8::String::New("primary_key"));
-  str_unique_key = v8::Persistent<v8::String>::New(v8::String::New("unique_key"));
-  str_multiple_key = v8::Persistent<v8::String>::New(v8::String::New("multiple_keys"));
-  str_unsigned = v8::Persistent<v8::String>::New(v8::String::New("unsigned"));
-  str_zerofill = v8::Persistent<v8::String>::New(v8::String::New("zerofill"));
-  str_binary = v8::Persistent<v8::String>::New(v8::String::New("binary"));
-  str_auto_increment = v8::Persistent<v8::String>::New(v8::String::New("auto_increment"));
-  str_enum = v8::Persistent<v8::String>::New(v8::String::New("enum"));
-  str_set = v8::Persistent<v8::String>::New(v8::String::New("set"));
-  str_numeric = v8::Persistent<v8::String>::New(v8::String::New("numeric"));
+  str_primary_key = v8::Persistent<v8::String>::New(v8::String::New("in_primary_key"));
+  str_unique_key = v8::Persistent<v8::String>::New(v8::String::New("in_unique_key"));
+  str_multiple_key = v8::Persistent<v8::String>::New(v8::String::New("in_multiple_keys"));
+  str_unsigned = v8::Persistent<v8::String>::New(v8::String::New("is_unsigned"));
+  str_zerofill = v8::Persistent<v8::String>::New(v8::String::New("is_zerofill"));
+  str_binary = v8::Persistent<v8::String>::New(v8::String::New("is_binary"));
+  str_auto_increment = v8::Persistent<v8::String>::New(v8::String::New("is_auto_increment"));
+  str_enum = v8::Persistent<v8::String>::New(v8::String::New("is_enum"));
+  str_set = v8::Persistent<v8::String>::New(v8::String::New("is_set"));
+  str_numeric = v8::Persistent<v8::String>::New(v8::String::New("is_numeric"));
 
   str_host = v8::Persistent<v8::String>::New(v8::String::New("host"));
   str_user = v8::Persistent<v8::String>::New(v8::String::New("user"));
@@ -2562,11 +2581,13 @@ static int js_daemon_plugin_init(MYSQL_PLUGIN){
   str_field_index_out_of_range = v8::Persistent<v8::String>::New(v8::String::New(MSG_FIELD_INDEX_OUT_OF_RANGE));
   str_expected_zero_arguments = v8::Persistent<v8::String>::New(v8::String::New(MSG_EXPECTED_ZERO_ARGUMENTS));
   str_expected_one_argument = v8::Persistent<v8::String>::New(v8::String::New(MSG_EXPECTED_ONE_ARGUMENT));
-  str_arg_must_be_array_or_object = v8::Persistent<v8::String>::New(v8::String::New(MSG_ARG_MUST_BE_ARRAY_OR_OBJECT));
+  str_arg_must_be_array_or_object_or_function = v8::Persistent<v8::String>::New(v8::String::New(MSG_ARG_MUST_BE_ARRAY_OR_OBJECT_OR_FUNCTION));
   str_arg_must_be_string = v8::Persistent<v8::String>::New(v8::String::New(MSG_ARG_MUST_BE_STRING));
   str_arg_must_be_object = v8::Persistent<v8::String>::New(v8::String::New(MSG_ARG_MUST_BE_OBJECT));
   str_arg_must_be_array = v8::Persistent<v8::String>::New(v8::String::New(MSG_ARG_MUST_BE_ARRAY));
   str_arg_must_be_boolean = v8::Persistent<v8::String>::New(v8::String::New(MSG_ARG_MUST_BE_BOOLEAN));
+  str_first_arg_must_be_function = v8::Persistent<v8::String>::New(v8::String::New(MSG_FIRST_ARG_MUST_BE_FUNCTION));
+  str_second_arg_must_be_object = v8::Persistent<v8::String>::New(v8::String::New(MSG_SECOND_ARG_MUST_BE_OBJECT));
   str_host_must_be_string = v8::Persistent<v8::String>::New(v8::String::New(MSG_HOST_MUST_BE_STRING));
   str_user_must_be_string = v8::Persistent<v8::String>::New(v8::String::New(MSG_USER_MUST_BE_STRING));
   str_password_must_be_string = v8::Persistent<v8::String>::New(v8::String::New(MSG_PASSWORD_MUST_BE_STRING));
@@ -2697,11 +2718,13 @@ static int js_daemon_plugin_deinit(MYSQL_PLUGIN){
   str_field_index_out_of_range.Dispose();
   str_expected_zero_arguments.Dispose();
   str_expected_one_argument.Dispose();
-  str_arg_must_be_array_or_object.Dispose();
+  str_arg_must_be_array_or_object_or_function.Dispose();
   str_arg_must_be_string.Dispose();
   str_arg_must_be_object.Dispose();
   str_arg_must_be_array.Dispose();
   str_arg_must_be_boolean.Dispose();
+  str_first_arg_must_be_function.Dispose();
+  str_second_arg_must_be_object.Dispose();
   str_host_must_be_string.Dispose();
   str_user_must_be_string.Dispose();
   str_password_must_be_string.Dispose();
