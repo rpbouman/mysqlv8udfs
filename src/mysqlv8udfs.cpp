@@ -1611,7 +1611,7 @@ v8::Handle<v8::Value> mysqlClientConnect(const v8::Arguments& args) {
   char user[16]; strcpy(user, "");
   char password[16]; strcpy(password, "");
   char schema[64]; strcpy(schema, "");
-  unsigned short port = 3306;
+  unsigned short port = MYSQL_PORT;
   char socket[128]; strcpy(socket, "");
   unsigned long flags = CLIENT_IGNORE_SPACE | CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS;
 
@@ -1667,9 +1667,10 @@ v8::Persistent<v8::ObjectTemplate> createMysqlClientTemplate(){
 }
 
 /**
- *  MySQL bindings: "namespace"
+ *  MySQL bindings: mysql "namespace"
  *
  */
+
 v8::Persistent<v8::ObjectTemplate> createMysqlTemplate(){
   v8::Handle<v8::ObjectTemplate> _mysqlTemplate = v8::ObjectTemplate::New();
   _mysqlTemplate->Set(v8::String::New("client"), mysqlClientTemplate->NewInstance());
