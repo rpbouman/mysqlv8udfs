@@ -84,6 +84,7 @@ unsigned long JS_INITIAL_RETURN_VALUE_LENGTH  = 255;
 #define INIT_ERROR                      1
 #define INIT_SUCCESS                    0
 
+#define PATH_SEPARATOR                  "/"
 
 static v8::Persistent<v8::ObjectTemplate> globalTemplate;
 static v8::Persistent<v8::ObjectTemplate> globalTemplateForUDFs;
@@ -101,6 +102,10 @@ static v8::Persistent<v8::String> str_deinit;
 static v8::Persistent<v8::String> str_udf;
 static v8::Persistent<v8::String> str_agg;
 static v8::Persistent<v8::String> str_clear;
+
+static v8::Persistent<v8::String> str_mysql;
+static v8::Persistent<v8::String> str_console;
+static v8::Persistent<v8::String> str_require;
 
 static v8::Persistent<v8::String> str_arguments;
 static v8::Persistent<v8::String> str_const_item;
@@ -198,6 +203,10 @@ static v8::Persistent<v8::String> str_results_already_consumed;
 static v8::Persistent<v8::Context> jsDaemonContext;
 static v8::HeapStatistics *js_daemon_heap_statistics;
 
+//system variable: holds the directory from where to load js modules.
+static char* js_module_path;
+MYSQL_SYSVAR_STR(module_path, js_module_path, PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG, "The directory from where to load javascript modules.", NULL, NULL, "js_modules");
+
 const char* ToCString(const v8::String::Utf8Value& value) {
   return *value ? *value : MSG_STRING_CONVERSION_FAILED;
 }
@@ -214,12 +223,222 @@ void force_v8_cleanup(){
 }
 
 void throwError(v8::Handle<v8::String> message) {
-  throwError(message);
+  v8::ThrowException(v8::Exception::Error(message));
 }
 
 void setConstant(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
   throwError(str_err_setting_api_constant);
 }
+
+/*
+ * Stuff to implement require (module loading)
+ *
+*/
+typedef struct cached_module CACHED_MODULE;
+
+struct cached_module {
+  v8::Persistent<v8::Value> module;
+  char *name;
+  CACHED_MODULE *next;
+};
+
+CACHED_MODULE* module_cache = NULL;
+CACHED_MODULE* last_module = module_cache;
+
+CACHED_MODULE* find_module(char *name) {
+  LOG_ERR("find module");
+  LOG_ERR(name);
+  CACHED_MODULE* module = module_cache;
+  while (module != NULL && strcmp(name, module->name)) {
+    LOG_ERR("looking at module:");
+    LOG_ERR(module->name);
+    module = module->next;
+  }
+  return module;
+}
+
+CACHED_MODULE* add_module(char *name, v8::Handle<v8::Value> value) {
+  LOG_ERR("add module");
+  LOG_ERR(name);
+  CACHED_MODULE* module = (CACHED_MODULE *)malloc(sizeof(struct cached_module));
+  if (module == NULL) return NULL;
+  module->name = (char *)malloc(strlen(name) + 1);
+  if (module->name == NULL) {
+    free(module);
+    return NULL;
+  }
+  strcpy(module->name, name);
+  //module->name = name;
+  module->module = v8::Persistent<v8::Value>::New(value);
+  module->next = NULL;
+
+  if (module_cache == NULL) {
+    LOG_ERR("module cache is null, assigning new module.")
+    module_cache = module;
+  }
+  if (last_module != NULL) {
+    LOG_ERR("last module is not null, chaining new module.")
+    last_module->next = module;
+  }
+
+  last_module = module;
+  return module;
+}
+
+void dispose_module(CACHED_MODULE *module){
+  LOG_ERR("dispose module");
+  LOG_ERR(module->name);
+  module->module.Dispose();
+  free(module->name);
+  free(module);
+}
+
+void clear_module_cache() {
+  LOG_ERR("clear module cache");
+  CACHED_MODULE* module = module_cache;
+  CACHED_MODULE* next;
+  while (module != NULL){
+    next = module->next;
+    module->next = NULL;
+    dispose_module(module);
+    module = next;
+  }
+  module_cache = NULL;
+  last_module = NULL;
+}
+
+FILE * open_script_file(char * script_name){
+  LOG_ERR("enter open_script_file");
+  int js_module_path_len = strlen(js_module_path);
+  int path_sep_len = strlen(PATH_SEPARATOR);
+  int script_name_len = strlen(script_name);
+  char *file_name = (char *)malloc(js_module_path_len + path_sep_len + script_name_len + 1);
+  if (script_name == NULL) {
+    LOG_ERR("Could not allocate filename");
+    return NULL;
+  }
+  memcpy(file_name, js_module_path, js_module_path_len);
+  memcpy(file_name + js_module_path_len, PATH_SEPARATOR, path_sep_len);
+  memcpy(file_name + (js_module_path_len + path_sep_len), script_name, script_name_len);
+  file_name[js_module_path_len + path_sep_len + script_name_len] = '\0';
+  LOG_ERR(file_name);
+  FILE *file = fopen(file_name, "rb");
+  free(file_name);
+  return file;
+}
+
+long get_file_size(FILE *file){
+  LOG_ERR("enter get_file_size");
+  fseek(file, 0L, SEEK_END);
+  long pos = ftell(file);
+  rewind(file);
+  return pos;
+}
+
+char *read_file_contents(FILE *file, long size){
+  LOG_ERR("enter read_file_contents");
+  long read = 0;
+  char *contents = (char *)malloc(size + 1);
+  if (contents == NULL) {
+    LOG_ERR("require: Error allocating buffer to hold file contents");
+    goto ready;
+  }
+
+  read = fread(contents, size, 1, file);
+  if (read != 1) {
+    LOG_ERR("require: Error reading file contents");
+    fprintf(stderr, "size: %i; read: %i", (int)size, (int)read);
+    free(contents);
+    contents = NULL;
+  }
+  contents[size] = '\0';
+ready:
+  return contents;
+}
+
+char * get_file_contents(FILE *file){
+  LOG_ERR("enter get_file_contents");
+  char *contents = NULL;
+  long pos = get_file_size(file);
+  if (pos == -1L) {
+    LOG_ERR("require: Error getting file size");
+    goto cleanup_file;
+  }
+  if (pos == 0){
+    LOG_ERR("require: file size is zero.");
+    goto cleanup_file;
+  }
+  contents = read_file_contents(file, pos);
+cleanup_file:
+  fclose(file);
+  return contents;
+}
+
+my_bool check_script_filename(char *file_name){
+  //TODO: checks if this is a valid file name
+  //* at a minimum, file name must not break free from module dir.
+  //* additional check: extension must be .js?
+  return TRUE;
+}
+
+v8::Handle<v8::Value> require(const v8::Arguments& args){
+  LOG_ERR("Enter require");
+  if (args.Length() != 1) {
+    LOG_ERR("Whoops, missing argument");
+    throwError(str_expected_one_argument);
+    return v8::Null();
+  }
+  if (!args[0]->IsString()) {
+    LOG_ERR("Whoops, argument is not a string");
+    throwError(str_arg_must_be_string);
+    return v8::Null();
+  }
+  v8::Local<v8::String> arg_file = args[0]->ToString();
+  v8::String::AsciiValue ascii(arg_file);
+  LOG_ERR("file:");
+  LOG_ERR(*ascii);
+  CACHED_MODULE *module = find_module(*ascii);
+  if (module != NULL) {
+    LOG_ERR("Cached module found");
+    return module->module;
+  }
+  if (check_script_filename(*ascii) == FALSE){
+    LOG_ERR("oops, script file name is invalid");
+    throwError(v8::String::New("require: invalid file name."));
+    return v8::Null();
+  }
+  FILE *file = open_script_file(*ascii);
+  if (file == NULL){
+    LOG_ERR("oops, file is NULL");
+    throwError(v8::String::New("require: Could not open file."));
+    return v8::Null();
+  }
+  char *contents = get_file_contents(file);
+  if (contents == NULL) {
+    LOG_ERR("oops, contents is NULL");
+    throwError(v8::String::New("require: Could not read file."));
+    return v8::Null();
+  }
+  LOG_ERR("script:");
+  LOG_ERR(contents);
+  v8::Local<v8::String> source = v8::String::New(contents);
+  v8::Handle<v8::Script> script = v8::Script::Compile(source);
+  if (script.IsEmpty()) {
+    LOG_ERR("oops, compilation error");
+    free(contents);
+    throwError(v8::String::New("require: Error compiling script."));
+    return v8::Null();
+  }
+  v8::Handle<v8::Value> value = script->Run();
+  module = add_module(*ascii, value);
+  if (module == NULL) {
+    LOG_ERR("error caching module");
+    throwError(v8::String::New("require: Error caching module."));
+    return v8::Null();
+  }
+  return module->module;
+}
+
 /**
  *
  * Wrappin UDF ARGs
@@ -1733,11 +1952,16 @@ v8::Handle<v8::Value> getNotFixedDecConstant(v8::Local<v8::String> property, con
   return int_NOT_FIXED_DEC;
 }
 
+void addBuiltInGlobals(v8::Handle<v8::ObjectTemplate> _template){
+  _template->Set(str_console, consoleTemplate->NewInstance());
+  _template->Set(str_mysql, mysqlTemplate->NewInstance());
+  _template->Set(str_require, v8::FunctionTemplate::New(require));
+}
+
 v8::Persistent<v8::ObjectTemplate> createGlobalTemplate(){
   v8::Handle<v8::ObjectTemplate> _template = v8::ObjectTemplate::New();
   _template->SetInternalFieldCount(1);
-  _template->Set(v8::String::New("mysql"), mysqlTemplate->NewInstance());
-  _template->Set(v8::String::New("console"), consoleTemplate->NewInstance());
+  addBuiltInGlobals(_template);
   return v8::Persistent<v8::ObjectTemplate>::New(_template);
 }
 
@@ -1750,8 +1974,7 @@ v8::Persistent<v8::ObjectTemplate> createGlobalTemplateForUDFs(){
   _template->SetAccessor(str_ROW_RESULT, getRowResultConstant, setConstant);
   _template->SetAccessor(str_DECIMAL_RESULT, getDecimalResultConstant, setConstant);
   _template->SetAccessor(str_NOT_FIXED_DEC, getNotFixedDecConstant, setConstant);
-  _template->Set(v8::String::New("mysql"), mysqlTemplate->NewInstance());
-  _template->Set(v8::String::New("console"), consoleTemplate->NewInstance());
+  addBuiltInGlobals(_template);
   return v8::Persistent<v8::ObjectTemplate>::New(_template);
 }
 
@@ -1966,8 +2189,11 @@ struct st_mysql_show_var js_daemon_status_vars[] =
 };
 
 static struct st_mysql_sys_var *js_daemon_system_vars[]= {
+  MYSQL_SYSVAR(module_path),
   NULL
 };
+
+
 
 /**
  *
@@ -2526,6 +2752,10 @@ static int js_daemon_plugin_init(MYSQL_PLUGIN){
   int_DECIMAL_RESULT = v8::Persistent<v8::Integer>::New(v8::Uint32::New(DECIMAL_RESULT));
   int_NOT_FIXED_DEC = v8::Persistent<v8::Integer>::New(v8::Uint32::New(NOT_FIXED_DEC));
 
+  str_mysql = v8::Persistent<v8::String>::New(v8::String::New("mysql"));
+  str_console = v8::Persistent<v8::String>::New(v8::String::New("console"));
+  str_require = v8::Persistent<v8::String>::New(v8::String::New("require"));
+
   str_arguments = v8::Persistent<v8::String>::New(v8::String::New("arguments"));
   str_const_item = v8::Persistent<v8::String>::New(v8::String::New("const_item"));
   str_decimals = v8::Persistent<v8::String>::New(v8::String::New("decimals"));
@@ -2647,6 +2877,10 @@ static int js_daemon_plugin_deinit(MYSQL_PLUGIN){
   str_clear.Dispose();
   str_deinit.Dispose();
 
+  str_console.Dispose();
+  str_mysql.Dispose();
+  str_require.Dispose();
+
   str_STRING_RESULT.Dispose();
   str_INT_RESULT.Dispose();
   str_DECIMAL_RESULT.Dispose();
@@ -2741,6 +2975,8 @@ static int js_daemon_plugin_deinit(MYSQL_PLUGIN){
   str_resultset_already_consumed.Dispose();
   str_query_not_yet_done.Dispose();
   str_results_already_consumed.Dispose();
+
+  clear_module_cache();
 
   jsDaemonContext->Exit();
   jsDaemonContext.Dispose();
