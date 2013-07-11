@@ -24,8 +24,10 @@
 
 unsigned long JS_INITIAL_RETURN_VALUE_LENGTH  = 255;
 
-#define JS_DAEMON_VERSION               "0.0.1";
-#define PLUGIN_NAME                     "JS_DAEMON"
+#define MYSQLV8_VERSION                 "0.0.1";
+#define JS_DAEMON_PLUGIN_NAME           "JS_DAEMON"
+#define JS_CACHED_MODULES_PLUGIN_NAME   "JS_CACHED_MODULES"
+
 #define LOG_LEVEL_ERROR                 "error"
 #define LOG_LEVEL_INFO                  "info"
 #define LOG_LEVEL_WARN                  "warn"
@@ -200,12 +202,7 @@ static v8::Persistent<v8::String> str_resultset_already_consumed;
 static v8::Persistent<v8::String> str_query_not_yet_done;
 static v8::Persistent<v8::String> str_results_already_consumed;
 
-static v8::Persistent<v8::Context> jsDaemonContext;
-static v8::HeapStatistics *js_daemon_heap_statistics;
-
-//system variable: holds the directory from where to load js modules.
 static char* js_module_path;
-MYSQL_SYSVAR_STR(module_path, js_module_path, PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG, "The directory from where to load javascript modules.", NULL, NULL, "js_modules");
 
 const char* ToCString(const v8::String::Utf8Value& value) {
   return *value ? *value : MSG_STRING_CONVERSION_FAILED;
@@ -239,6 +236,7 @@ typedef struct cached_module CACHED_MODULE;
 struct cached_module {
   v8::Persistent<v8::Value> module;
   char *name;
+  char *source;
   CACHED_MODULE *next;
 };
 
@@ -246,20 +244,14 @@ CACHED_MODULE* module_cache = NULL;
 CACHED_MODULE* last_module = module_cache;
 
 CACHED_MODULE* find_module(char *name) {
-  LOG_ERR("find module");
-  LOG_ERR(name);
   CACHED_MODULE* module = module_cache;
   while (module != NULL && strcmp(name, module->name)) {
-    LOG_ERR("looking at module:");
-    LOG_ERR(module->name);
     module = module->next;
   }
   return module;
 }
 
-CACHED_MODULE* add_module(char *name, v8::Handle<v8::Value> value) {
-  LOG_ERR("add module");
-  LOG_ERR(name);
+CACHED_MODULE* add_module(char *name, char *source, v8::Handle<v8::Value> value) {
   CACHED_MODULE* module = (CACHED_MODULE *)malloc(sizeof(struct cached_module));
   if (module == NULL) return NULL;
   module->name = (char *)malloc(strlen(name) + 1);
@@ -267,17 +259,17 @@ CACHED_MODULE* add_module(char *name, v8::Handle<v8::Value> value) {
     free(module);
     return NULL;
   }
+  //we have to copy the name, since that is normally taken from a js string argument.
   strcpy(module->name, name);
-  //module->name = name;
+  //we can simply assign the source, since we allocated that ourselves.
+  module->source = source;
   module->module = v8::Persistent<v8::Value>::New(value);
   module->next = NULL;
 
   if (module_cache == NULL) {
-    LOG_ERR("module cache is null, assigning new module.")
     module_cache = module;
   }
   if (last_module != NULL) {
-    LOG_ERR("last module is not null, chaining new module.")
     last_module->next = module;
   }
 
@@ -286,15 +278,13 @@ CACHED_MODULE* add_module(char *name, v8::Handle<v8::Value> value) {
 }
 
 void dispose_module(CACHED_MODULE *module){
-  LOG_ERR("dispose module");
-  LOG_ERR(module->name);
   module->module.Dispose();
   free(module->name);
+  free(module->source);
   free(module);
 }
 
 void clear_module_cache() {
-  LOG_ERR("clear module cache");
   CACHED_MODULE* module = module_cache;
   CACHED_MODULE* next;
   while (module != NULL){
@@ -308,7 +298,6 @@ void clear_module_cache() {
 }
 
 FILE * open_script_file(char * script_name){
-  LOG_ERR("enter open_script_file");
   int js_module_path_len = strlen(js_module_path);
   int path_sep_len = strlen(PATH_SEPARATOR);
   int script_name_len = strlen(script_name);
@@ -328,7 +317,6 @@ FILE * open_script_file(char * script_name){
 }
 
 long get_file_size(FILE *file){
-  LOG_ERR("enter get_file_size");
   fseek(file, 0L, SEEK_END);
   long pos = ftell(file);
   rewind(file);
@@ -336,7 +324,6 @@ long get_file_size(FILE *file){
 }
 
 char *read_file_contents(FILE *file, long size){
-  LOG_ERR("enter read_file_contents");
   long read = 0;
   char *contents = (char *)malloc(size + 1);
   if (contents == NULL) {
@@ -357,7 +344,6 @@ ready:
 }
 
 char * get_file_contents(FILE *file){
-  LOG_ERR("enter get_file_contents");
   char *contents = NULL;
   long pos = get_file_size(file);
   if (pos == -1L) {
@@ -382,7 +368,6 @@ my_bool check_script_filename(char *file_name){
 }
 
 v8::Handle<v8::Value> require(const v8::Arguments& args){
-  LOG_ERR("Enter require");
   if (args.Length() != 1) {
     LOG_ERR("Whoops, missing argument");
     throwError(str_expected_one_argument);
@@ -395,11 +380,8 @@ v8::Handle<v8::Value> require(const v8::Arguments& args){
   }
   v8::Local<v8::String> arg_file = args[0]->ToString();
   v8::String::AsciiValue ascii(arg_file);
-  LOG_ERR("file:");
-  LOG_ERR(*ascii);
   CACHED_MODULE *module = find_module(*ascii);
   if (module != NULL) {
-    LOG_ERR("Cached module found");
     return module->module;
   }
   if (check_script_filename(*ascii) == FALSE){
@@ -419,8 +401,6 @@ v8::Handle<v8::Value> require(const v8::Arguments& args){
     throwError(v8::String::New("require: Could not read file."));
     return v8::Null();
   }
-  LOG_ERR("script:");
-  LOG_ERR(contents);
   v8::Local<v8::String> source = v8::String::New(contents);
   v8::Handle<v8::Script> script = v8::Script::Compile(source);
   if (script.IsEmpty()) {
@@ -430,7 +410,7 @@ v8::Handle<v8::Value> require(const v8::Arguments& args){
     return v8::Null();
   }
   v8::Handle<v8::Value> value = script->Run();
-  module = add_module(*ascii, value);
+  module = add_module(*ascii, contents, value);
   if (module == NULL) {
     LOG_ERR("error caching module");
     throwError(v8::String::New("require: Error caching module."));
@@ -982,7 +962,17 @@ v8::Handle<v8::Value> mysqlQueryResultSetField(const v8::Arguments& args) {
   v8::Local<v8::Object> mysqlQueryField = v8::Object::New();
   LOG_ERR("populating field");
   mysqlQueryField->Set(str_name, v8::String::New(field->name));
-  mysqlQueryField->Set(str_type, v8::Uint32::New(field->type));
+  mysqlQueryField->Set(
+    str_type,
+    v8::Uint32::New(
+      field->flags & ENUM_FLAG
+      ? MYSQL_TYPE_ENUM
+      : ( field->flags & SET_FLAG
+        ? MYSQL_TYPE_SET
+        : field->type
+        )
+    )
+  );
   mysqlQueryField->Set(str_charsetnr, v8::Uint32::New(field->charsetnr));
   mysqlQueryField->Set(str_org_name, v8::String::New(field->org_name));
   mysqlQueryField->Set(str_table, v8::String::New(field->table));
@@ -999,8 +989,6 @@ v8::Handle<v8::Value> mysqlQueryResultSetField(const v8::Arguments& args) {
   mysqlQueryField->Set(str_zerofill, field->flags & ZEROFILL_FLAG ? v8::True() : v8::False());
   mysqlQueryField->Set(str_binary, field->flags & BINARY_FLAG ? v8::True() : v8::False());
   mysqlQueryField->Set(str_auto_increment, field->flags & AUTO_INCREMENT_FLAG ? v8::True() : v8::False());
-  mysqlQueryField->Set(str_enum, field->flags & ENUM_FLAG ? v8::True() : v8::False());
-  mysqlQueryField->Set(str_set, field->flags & SET_FLAG ? v8::True() : v8::False());
   mysqlQueryField->Set(str_numeric, field->flags & NUM_FLAG ? v8::True() : v8::False());
   return mysqlQueryField;
 }
@@ -1997,7 +1985,7 @@ v8::Handle<v8::Value> log(const char *kind, const v8::Arguments& args){
       timeinfo->tm_min,
       timeinfo->tm_sec  < 10 ? "0" : "",
       timeinfo->tm_sec,
-      PLUGIN_NAME,
+      JS_DAEMON_PLUGIN_NAME,
       kind
     );
   }
@@ -2093,106 +2081,6 @@ void add_udf_init_accessors(v8::Local<v8::Object> object, UDF_INIT* initid){
   object->SetAccessor(str_max_length, get_max_length, set_max_length);
   object->SetAccessor(str_maybe_null, get_maybe_null, set_maybe_null);
 }
-
-/**
- *
- *  js_daemon plugin
- *
- */
-v8::HeapStatistics *createHeapStatistics(){
-  v8::HeapStatistics *heapStatistics = new v8::HeapStatistics();
-  return heapStatistics;
-}
-
-void updateHeapStatistics(){
-  v8::Locker locker;
-  v8::V8::GetHeapStatistics(js_daemon_heap_statistics);
-}
-
-int status_var_version(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
-  var->type = SHOW_CHAR;
-  var->value = (char *)JS_DAEMON_VERSION;
-  return 0;
-}
-
-int status_var_v8_heap_size_limit(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
-  var->type = SHOW_INT;
-  updateHeapStatistics();
-  *buff = (int)js_daemon_heap_statistics->heap_size_limit();
-  var->value = buff;
-  return 0;
-}
-
-int status_var_v8_heap_size_total(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
-  var->type = SHOW_INT;
-  updateHeapStatistics();
-  *buff = (int)js_daemon_heap_statistics->total_heap_size();
-  var->value = buff;
-  return 0;
-}
-
-int status_var_v8_heap_size_total_executable(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
-  var->type = SHOW_INT;
-  updateHeapStatistics();
-  *buff = (int)js_daemon_heap_statistics->total_heap_size_executable();
-  var->value = buff;
-  return 0;
-}
-
-int status_var_v8_heap_size_used(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
-  var->type = SHOW_INT;
-  updateHeapStatistics();
-  *buff = (int)js_daemon_heap_statistics->used_heap_size();
-  var->value = buff;
-  return 0;
-}
-
-int status_var_v8_is_dead(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
-  var->type = SHOW_CHAR;
-  sprintf(buff, "%s", v8::V8::IsDead() ? STR_TRUE : STR_FALSE);
-  var->value = buff;
-  return 0;
-}
-
-int status_var_v8_is_execution_terminating(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
-  var->type = SHOW_CHAR;
-  sprintf(buff, "%s", v8::V8::IsExecutionTerminating() ? STR_TRUE : STR_FALSE);
-  var->value = buff;
-  return 0;
-}
-
-int status_var_v8_is_profiler_paused(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
-  var->type = SHOW_CHAR;
-  sprintf(buff, "%s", v8::V8::IsProfilerPaused() ? STR_TRUE : STR_FALSE);
-  var->value = buff;
-  return 0;
-}
-
-int status_var_v8_version(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
-  var->type = SHOW_CHAR;
-  var->value = (char *)v8::V8::GetVersion();
-  return 0;
-}
-
-struct st_mysql_show_var js_daemon_status_vars[] =
-{
-  {"js_daemon_version", (char *)&status_var_version, SHOW_FUNC},
-  {"js_v8_heap_size_limit", (char *)&status_var_v8_heap_size_limit, SHOW_FUNC},
-  {"js_v8_heap_size_total", (char *)&status_var_v8_heap_size_total, SHOW_FUNC},
-  {"js_v8_heap_size_total_executable", (char *)&status_var_v8_heap_size_total_executable, SHOW_FUNC},
-  {"js_v8_heap_size_used", (char *)&status_var_v8_heap_size_used, SHOW_FUNC},
-  {"js_v8_is_dead", (char *)&status_var_v8_is_dead, SHOW_FUNC},
-  {"js_v8_is_execution_terminating", (char *)&status_var_v8_is_execution_terminating, SHOW_FUNC},
-  {"js_v8_is_profiler_paused", (char *)&status_var_v8_is_profiler_paused, SHOW_FUNC},
-  {"js_v8_version", (char *)&status_var_v8_version, SHOW_FUNC},
-  {0, 0, SHOW_UNDEF}
-};
-
-static struct st_mysql_sys_var *js_daemon_system_vars[]= {
-  MYSQL_SYSVAR(module_path),
-  NULL
-};
-
 
 
 /**
@@ -2716,8 +2604,140 @@ void jsagg_add(
   v8res->udf->Call(v8res->context->Global(), args->arg_count - 1, v8res->arg_values);
   v8res->context->Exit();
 }
+/**
+ *
+ *  js_cached_modules plugin (information schema)
+static struct st_mysql_information_schema mysql_information_schema_plugin_info = {
+  MYSQL_INFORMATION_SCHEMA_INTERFACE_VERSION
+};
 
-struct st_mysql_daemon js_daemon_info = {
+bool js_cached_modules_store_record(THD *thd, TABLE *table);
+static ST_FIELD_INFO js_cached_modules_fields_info[] = {
+  {"NAME", 30, MYSQL_TYPE_STRING, 0, 0, 0, 0},
+  {"SOURCE", 10, MYSQL_TYPE_LONG, 0, 0, 0, 0},
+  {0, 0, MYSQL_TYPE_NULL, 0, 0, 0, 0}
+};
+
+static int js_cached_modules_fill_table(THD *thd, TABLE_LIST *tables, COND *cond){
+}
+
+static int js_cached_modules_init(void *p)
+{
+  ST_SCHEMA_TABLE *schema= (ST_SCHEMA_TABLE *)p;
+
+  schema->fields_info= js_cached_modules_fields_info;
+  schema->fill_table= js_cached_modules_fill_table;
+
+  return 0;
+}
+ */
+
+/**
+ *
+ *  js_daemon plugin (daemon)
+ *
+ */
+static v8::Persistent<v8::Context> jsDaemonContext;
+static v8::HeapStatistics *js_daemon_heap_statistics;
+
+//system variable: holds the directory from where to load js modules.
+MYSQL_SYSVAR_STR(module_path, js_module_path, PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG, "The directory from where to load javascript modules.", NULL, NULL, "js_modules");
+
+v8::HeapStatistics *createHeapStatistics(){
+  v8::HeapStatistics *heapStatistics = new v8::HeapStatistics();
+  return heapStatistics;
+}
+
+void updateHeapStatistics(){
+  v8::Locker locker;
+  v8::V8::GetHeapStatistics(js_daemon_heap_statistics);
+}
+
+int status_var_version(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_CHAR;
+  var->value = (char *)MYSQLV8_VERSION;
+  return 0;
+}
+
+int status_var_v8_heap_size_limit(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_INT;
+  updateHeapStatistics();
+  *buff = (int)js_daemon_heap_statistics->heap_size_limit();
+  var->value = buff;
+  return 0;
+}
+
+int status_var_v8_heap_size_total(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_INT;
+  updateHeapStatistics();
+  *buff = (int)js_daemon_heap_statistics->total_heap_size();
+  var->value = buff;
+  return 0;
+}
+
+int status_var_v8_heap_size_total_executable(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_INT;
+  updateHeapStatistics();
+  *buff = (int)js_daemon_heap_statistics->total_heap_size_executable();
+  var->value = buff;
+  return 0;
+}
+
+int status_var_v8_heap_size_used(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_INT;
+  updateHeapStatistics();
+  *buff = (int)js_daemon_heap_statistics->used_heap_size();
+  var->value = buff;
+  return 0;
+}
+
+int status_var_v8_is_dead(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_CHAR;
+  sprintf(buff, "%s", v8::V8::IsDead() ? STR_TRUE : STR_FALSE);
+  var->value = buff;
+  return 0;
+}
+
+int status_var_v8_is_execution_terminating(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_CHAR;
+  sprintf(buff, "%s", v8::V8::IsExecutionTerminating() ? STR_TRUE : STR_FALSE);
+  var->value = buff;
+  return 0;
+}
+
+int status_var_v8_is_profiler_paused(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_CHAR;
+  sprintf(buff, "%s", v8::V8::IsProfilerPaused() ? STR_TRUE : STR_FALSE);
+  var->value = buff;
+  return 0;
+}
+
+int status_var_v8_version(MYSQL_THD thd, struct st_mysql_show_var *var, char *buff){
+  var->type = SHOW_CHAR;
+  var->value = (char *)v8::V8::GetVersion();
+  return 0;
+}
+
+struct st_mysql_show_var js_daemon_status_vars[] =
+{
+  {"js_daemon_version", (char *)&status_var_version, SHOW_FUNC},
+  {"js_v8_heap_size_limit", (char *)&status_var_v8_heap_size_limit, SHOW_FUNC},
+  {"js_v8_heap_size_total", (char *)&status_var_v8_heap_size_total, SHOW_FUNC},
+  {"js_v8_heap_size_total_executable", (char *)&status_var_v8_heap_size_total_executable, SHOW_FUNC},
+  {"js_v8_heap_size_used", (char *)&status_var_v8_heap_size_used, SHOW_FUNC},
+  {"js_v8_is_dead", (char *)&status_var_v8_is_dead, SHOW_FUNC},
+  {"js_v8_is_execution_terminating", (char *)&status_var_v8_is_execution_terminating, SHOW_FUNC},
+  {"js_v8_is_profiler_paused", (char *)&status_var_v8_is_profiler_paused, SHOW_FUNC},
+  {"js_v8_version", (char *)&status_var_v8_version, SHOW_FUNC},
+  {0, 0, SHOW_UNDEF}
+};
+
+static struct st_mysql_sys_var *js_daemon_system_vars[]= {
+  MYSQL_SYSVAR(module_path),
+  NULL
+};
+
+static struct st_mysql_daemon mysql_daemon_plugin_info = {
   MYSQL_DAEMON_INTERFACE_VERSION
 };
 
@@ -2986,11 +3006,28 @@ static int js_daemon_plugin_deinit(MYSQL_PLUGIN){
   return 0;
 }
 
-mysql_declare_plugin(js_daemon)
+mysql_declare_plugin(plugins)
+/*
+{
+  MYSQL_INFORMATION_SCHEMA_PLUGIN,
+  &mysql_information_schema_plugin_info,
+  JS_CACHED_MODULES_PLUGIN_NAME,
+  "Roland Bouman",
+  "Javascript Daemon - Manages resources for the js* UDFs - https://github.com/rpbouman/mysqlv8udfs",
+  PLUGIN_LICENSE_GPL,
+  js_cached_modules_init,
+  js_cached_modules_deinit,
+  0x0100,
+  NULL,
+  NULL,
+  NULL
+}
+,
+*/
 {
   MYSQL_DAEMON_PLUGIN,
-  &js_daemon_info,
-  PLUGIN_NAME,
+  &mysql_daemon_plugin_info,
+  JS_DAEMON_PLUGIN_NAME,
   "Roland Bouman",
   "Javascript Daemon - Manages resources for the js* UDFs - https://github.com/rpbouman/mysqlv8udfs",
   PLUGIN_LICENSE_GPL,
