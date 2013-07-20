@@ -52,34 +52,35 @@ unsigned long JS_INITIAL_RETURN_VALUE_LENGTH  = 255;
 #define MSG_OK                          "Ok."
 #define MSG_STRING_CONVERSION_FAILED    "<string conversion failed>"
 
-#define MSG_CONNECTION_ALREADY_CLOSED   "Connection already closed."
-#define MSG_NOT_ALL_RESULTS_CONSUMED    "Not all results were consumed"
-#define MSG_RESULTSET_ALREADY_EXHAUSTED "Resultset already exhausted"
-#define MSG_FIELD_INDEX_OUT_OF_RANGE    "Field index out of range"
-#define MSG_FIELD_INDEX_MUST_BE_INT     "Field index argument should be an unsigned integer"
-#define MSG_EXPECTED_ZERO_ARGUMENTS     "No arguments allowed"
-#define MSG_EXPECTED_ONE_ARGUMENT       "Expect at most 1 argument"
+#define MSG_CONNECTION_ALREADY_CLOSED               "Connection already closed."
+#define MSG_NOT_ALL_RESULTS_CONSUMED                "Not all results were consumed"
+#define MSG_RESULTSET_ALREADY_EXHAUSTED             "Resultset already exhausted"
+#define MSG_FIELD_INDEX_OUT_OF_RANGE                "Field index out of range"
+#define MSG_FIELD_INDEX_MUST_BE_INT                 "Field index argument should be an unsigned integer"
+#define MSG_EXPECTED_ZERO_ARGUMENTS                 "No arguments allowed"
+#define MSG_EXPECTED_ONE_ARGUMENT                   "Expect at most 1 argument"
+#define MSG_TOO_MANY_ARGUMENTS                      "Too many arguments"
 #define MSG_ARG_MUST_BE_ARRAY_OR_OBJECT_OR_FUNCTION "Argument must be either an array or an object or a function"
-#define MSG_ARG_MUST_BE_STRING          "Argument must be a string"
-#define MSG_ARG_MUST_BE_OBJECT          "Argument must be an object"
-#define MSG_ARG_MUST_BE_ARRAY           "Argument must be an array"
-#define MSG_ARG_MUST_BE_BOOLEAN         "Argument must be a boolean"
-#define MSG_FIRST_ARG_MUST_BE_FUNCTION  "First argument must be a function"
-#define MSG_SECOND_ARG_MUST_BE_OBJECT   "Second argument must be an object"
-#define MSG_HOST_MUST_BE_STRING         "Host must be a string"
-#define MSG_USER_MUST_BE_STRING         "User must be a string"
-#define MSG_PASSWORD_MUST_BE_STRING     "Password must be a string"
-#define MSG_SCHEMA_MUST_BE_STRING       "Schema must be a string"
-#define MSG_SOCKET_MUST_BE_STRING       "Socket must be a string"
-#define MSG_PORT_MUST_BE_INT            "Port must be an int"
-#define MSG_ERR_CONNECTING_TO_MYSQL     "Error connecting to MySQL"
-#define MSG_COULD_NOT_ALLOCATE_MYSQL_RESOURCE "Could not allocate MySQL resource"
-#define MSG_MEMBER_SQL_MUST_BE_STRING   "Member sql must be a string"
-#define MSG_QUERY_ALREADY_PREPARED      "Query already prepared"
-#define MSG_QUERY_NOT_YET_DONE          "Query not yet done"
-#define MSG_FAILED_TO_ALLOCATE_STATEMENT "Failed to allocate statement"
-#define MSG_RESULTS_ALREADY_CONSUMED     "Results already consumed"
-#define MSG_FAILED_TO_ALLOCATE_FIELD_EXTRACTORS "Failed to allocate field extractors"
+#define MSG_ARG_MUST_BE_STRING                      "Argument must be a string"
+#define MSG_ARG_MUST_BE_OBJECT                      "Argument must be an object"
+#define MSG_ARG_MUST_BE_ARRAY                       "Argument must be an array"
+#define MSG_ARG_MUST_BE_BOOLEAN                     "Argument must be a boolean"
+#define MSG_FIRST_ARG_MUST_BE_FUNCTION              "First argument must be a function"
+#define MSG_SECOND_ARG_MUST_BE_OBJECT               "Second argument must be an object"
+#define MSG_HOST_MUST_BE_STRING                     "Host must be a string"
+#define MSG_USER_MUST_BE_STRING                     "User must be a string"
+#define MSG_PASSWORD_MUST_BE_STRING                 "Password must be a string"
+#define MSG_SCHEMA_MUST_BE_STRING                   "Schema must be a string"
+#define MSG_SOCKET_MUST_BE_STRING                   "Socket must be a string"
+#define MSG_PORT_MUST_BE_INT                        "Port must be an int"
+#define MSG_ERR_CONNECTING_TO_MYSQL                 "Error connecting to MySQL"
+#define MSG_COULD_NOT_ALLOCATE_MYSQL_RESOURCE       "Could not allocate MySQL resource"
+#define MSG_MEMBER_SQL_MUST_BE_STRING               "Member sql must be a string"
+#define MSG_QUERY_ALREADY_PREPARED                  "Query already prepared"
+#define MSG_QUERY_NOT_YET_DONE                      "Query not yet done"
+#define MSG_FAILED_TO_ALLOCATE_STATEMENT            "Failed to allocate statement"
+#define MSG_RESULTS_ALREADY_CONSUMED                "Results already consumed"
+#define MSG_FAILED_TO_ALLOCATE_FIELD_EXTRACTORS     "Failed to allocate field extractors"
 
 #define LOG_ERR(a) fprintf(stderr, "\n%s", a);
 
@@ -179,6 +180,7 @@ static v8::Persistent<v8::String> str_field_index_out_of_range;
 static v8::Persistent<v8::String> str_field_index_must_be_int;
 static v8::Persistent<v8::String> str_expected_zero_arguments;
 static v8::Persistent<v8::String> str_expected_one_argument;
+static v8::Persistent<v8::String> str_too_many_arguments;
 static v8::Persistent<v8::String> str_arg_must_be_array_or_object_or_function;
 static v8::Persistent<v8::String> str_arg_must_be_string;
 static v8::Persistent<v8::String> str_arg_must_be_object;
@@ -203,6 +205,7 @@ static v8::Persistent<v8::String> str_query_not_yet_done;
 static v8::Persistent<v8::String> str_results_already_consumed;
 
 static char* js_module_path;
+static v8::Persistent<v8::Context> jsDaemonContext;
 
 const char* ToCString(const v8::String::Utf8Value& value) {
   return *value ? *value : MSG_STRING_CONVERSION_FAILED;
@@ -368,9 +371,14 @@ my_bool check_script_filename(char *file_name){
 }
 
 v8::Handle<v8::Value> require(const v8::Arguments& args){
-  if (args.Length() != 1) {
+  if (args.Length() < 1) {
     LOG_ERR("Whoops, missing argument");
     throwError(str_expected_one_argument);
+    return v8::Null();
+  }
+  if (args.Length() > 2) {
+    LOG_ERR("Whoops, too many arguments");
+    throwError(str_too_many_arguments);
     return v8::Null();
   }
   if (!args[0]->IsString()) {
@@ -378,11 +386,22 @@ v8::Handle<v8::Value> require(const v8::Arguments& args){
     throwError(str_arg_must_be_string);
     return v8::Null();
   }
+  my_bool force = FALSE;
+  if (args.Length() == 2) {
+    force = args[1]->ToBoolean()->IsTrue() ? TRUE : FALSE;
+  }
   v8::Local<v8::String> arg_file = args[0]->ToString();
   v8::String::AsciiValue ascii(arg_file);
   CACHED_MODULE *module = find_module(*ascii);
   if (module != NULL) {
-    return module->module;
+    LOG_ERR("Found module");
+    if (force == FALSE) {
+      return module->module;
+    }
+    LOG_ERR("forcing reload");
+  }
+  else {
+    LOG_ERR("Module not found");
   }
   if (check_script_filename(*ascii) == FALSE){
     LOG_ERR("oops, script file name is invalid");
@@ -401,6 +420,10 @@ v8::Handle<v8::Value> require(const v8::Arguments& args){
     throwError(v8::String::New("require: Could not read file."));
     return v8::Null();
   }
+  LOG_ERR("contents:");
+  LOG_ERR(contents);
+
+  LOG_ERR("Compiling module script");
   v8::Local<v8::String> source = v8::String::New(contents);
   v8::Handle<v8::Script> script = v8::Script::Compile(source);
   if (script.IsEmpty()) {
@@ -409,12 +432,27 @@ v8::Handle<v8::Value> require(const v8::Arguments& args){
     throwError(v8::String::New("require: Error compiling script."));
     return v8::Null();
   }
+
+  LOG_ERR("Running module script");
   v8::Handle<v8::Value> value = script->Run();
-  module = add_module(*ascii, contents, value);
+
+  LOG_ERR("Caching module");
   if (module == NULL) {
-    LOG_ERR("error caching module");
-    throwError(v8::String::New("require: Error caching module."));
-    return v8::Null();
+    LOG_ERR("creating new module");
+    module = add_module(*ascii, contents, value);
+    if (module == NULL) {
+      LOG_ERR("error caching module");
+      throwError(v8::String::New("require: Error caching module."));
+      return v8::Null();
+    }
+  }
+  else {
+    LOG_ERR("cleaning up old cached module");
+    if (module->source != NULL) free(module->source);
+    module->module.Dispose();
+    LOG_ERR("updating module");
+    module->source = contents;
+    module->module = v8::Persistent<v8::Value>::New(value);
   }
   return module->module;
 }
@@ -2604,6 +2642,7 @@ void jsagg_add(
   v8res->udf->Call(v8res->context->Global(), args->arg_count - 1, v8res->arg_values);
   v8res->context->Exit();
 }
+
 /**
  *
  *  js_cached_modules plugin (information schema)
@@ -2637,7 +2676,6 @@ static int js_cached_modules_init(void *p)
  *  js_daemon plugin (daemon)
  *
  */
-static v8::Persistent<v8::Context> jsDaemonContext;
 static v8::HeapStatistics *js_daemon_heap_statistics;
 
 //system variable: holds the directory from where to load js modules.
@@ -2832,6 +2870,7 @@ static int js_daemon_plugin_init(MYSQL_PLUGIN){
   str_field_index_out_of_range = v8::Persistent<v8::String>::New(v8::String::New(MSG_FIELD_INDEX_OUT_OF_RANGE));
   str_expected_zero_arguments = v8::Persistent<v8::String>::New(v8::String::New(MSG_EXPECTED_ZERO_ARGUMENTS));
   str_expected_one_argument = v8::Persistent<v8::String>::New(v8::String::New(MSG_EXPECTED_ONE_ARGUMENT));
+  str_too_many_arguments = v8::Persistent<v8::String>::New(v8::String::New(MSG_TOO_MANY_ARGUMENTS));
   str_arg_must_be_array_or_object_or_function = v8::Persistent<v8::String>::New(v8::String::New(MSG_ARG_MUST_BE_ARRAY_OR_OBJECT_OR_FUNCTION));
   str_arg_must_be_string = v8::Persistent<v8::String>::New(v8::String::New(MSG_ARG_MUST_BE_STRING));
   str_arg_must_be_object = v8::Persistent<v8::String>::New(v8::String::New(MSG_ARG_MUST_BE_OBJECT));
@@ -2973,6 +3012,7 @@ static int js_daemon_plugin_deinit(MYSQL_PLUGIN){
   str_field_index_out_of_range.Dispose();
   str_expected_zero_arguments.Dispose();
   str_expected_one_argument.Dispose();
+  str_too_many_arguments.Dispose();
   str_arg_must_be_array_or_object_or_function.Dispose();
   str_arg_must_be_string.Dispose();
   str_arg_must_be_object.Dispose();
