@@ -238,6 +238,7 @@ typedef struct cached_module CACHED_MODULE;
 
 struct cached_module {
   v8::Persistent<v8::Value> module;
+  v8::Persistent<v8::Script> script;
   char *name;
   char *source;
   CACHED_MODULE *next;
@@ -254,7 +255,7 @@ CACHED_MODULE* find_module(char *name) {
   return module;
 }
 
-CACHED_MODULE* add_module(char *name, char *source, v8::Handle<v8::Value> value) {
+CACHED_MODULE* add_module(char *name, char *source, v8::Handle<v8::Value> value, v8::Handle<v8::Script> script) {
   CACHED_MODULE* module = (CACHED_MODULE *)malloc(sizeof(struct cached_module));
   if (module == NULL) return NULL;
   module->name = (char *)malloc(strlen(name) + 1);
@@ -267,6 +268,7 @@ CACHED_MODULE* add_module(char *name, char *source, v8::Handle<v8::Value> value)
   //we can simply assign the source, since we allocated that ourselves.
   module->source = source;
   module->module = v8::Persistent<v8::Value>::New(value);
+  module->script = v8::Persistent<v8::Script>::New(script);
   module->next = NULL;
 
   if (module_cache == NULL) {
@@ -282,6 +284,7 @@ CACHED_MODULE* add_module(char *name, char *source, v8::Handle<v8::Value> value)
 
 void dispose_module(CACHED_MODULE *module){
   module->module.Dispose();
+  module->script.Dispose();
   free(module->name);
   free(module->source);
   free(module);
@@ -396,7 +399,8 @@ v8::Handle<v8::Value> require(const v8::Arguments& args){
   if (module != NULL) {
     LOG_ERR("Found module");
     if (force == FALSE) {
-      return module->module;
+      //return module->module;
+      return module->script->Run();
     }
     LOG_ERR("forcing reload");
   }
@@ -425,7 +429,7 @@ v8::Handle<v8::Value> require(const v8::Arguments& args){
 
   LOG_ERR("Compiling module script");
   v8::Local<v8::String> source = v8::String::New(contents);
-  v8::Handle<v8::Script> script = v8::Script::Compile(source);
+  v8::Handle<v8::Script> script = v8::Script::New(source);
   if (script.IsEmpty()) {
     LOG_ERR("oops, compilation error");
     free(contents);
@@ -439,7 +443,7 @@ v8::Handle<v8::Value> require(const v8::Arguments& args){
   LOG_ERR("Caching module");
   if (module == NULL) {
     LOG_ERR("creating new module");
-    module = add_module(*ascii, contents, value);
+    module = add_module(*ascii, contents, value, script);
     if (module == NULL) {
       LOG_ERR("error caching module");
       throwError(v8::String::New("require: Error caching module."));
@@ -450,8 +454,10 @@ v8::Handle<v8::Value> require(const v8::Arguments& args){
     LOG_ERR("cleaning up old cached module");
     if (module->source != NULL) free(module->source);
     module->module.Dispose();
+    module->script.Dispose();
     LOG_ERR("updating module");
     module->source = contents;
+    module->script = v8::Persistent<v8::Script>::New(script);
     module->module = v8::Persistent<v8::Value>::New(value);
   }
   return module->module;
