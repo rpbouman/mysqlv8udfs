@@ -733,6 +733,7 @@ char* call_udf_return_func(
   v8::Local<v8::Value> value = func->Call(
     v8res->context->Global(), args->arg_count - 1, v8res->arg_values
   );
+
   if (value.IsEmpty()) {
     //error calling function
     LOG_ERR(MSG_RUNTIME_SCRIPT_ERROR);
@@ -741,6 +742,7 @@ char* call_udf_return_func(
     *error = TRUE;
     return NULL;
   }
+
   if (value->IsNull()) {
     *is_null = TRUE;
     v8res->context->Exit();
@@ -2374,7 +2376,9 @@ void js_deinit(UDF_INIT *initid){
   if (initid->ptr == NULL) return;
   //clean up v8
   V8RES *v8res = (V8RES *)initid->ptr;
-  if (v8res->result != NULL) free(v8res->result);
+  if (v8res->result != NULL && v8res->max_result_length != 0) {
+    free(v8res->result);
+  }
   if (v8res->arg_extractors != NULL) free(v8res->arg_extractors);
   if (v8res->arg_values != NULL) free(v8res->arg_values);
   //v8 introductory voodoo incantations

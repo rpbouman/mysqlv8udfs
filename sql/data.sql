@@ -46,7 +46,7 @@ var y = parseInt(arguments[0].substr(0,4), 10),
     }
 
     if (argc == 2) {
-      //we will 1 or 0 for match or no match,
+      //we will return 1 or 0 for match or no match,
       //this is only 1 char wide:
       this.max_length = 1;
       return;
@@ -63,19 +63,32 @@ var y = parseInt(arguments[0].substr(0,4), 10),
         arg.type = INT_RESULT;
         break;
       default:
-        throw "Argument 3 must be an integer."
+        throw "Argument 3 must be an number."
     }
   }
 
-  function udf(){
-    var re = regexp ? regexp : new RegExp(argv[0].value);
-    if (argv == 2)
-      return re.test(argv[1].value) ? 1 : 0;
-    }
-    else {
-      return re.exec(argv[1].value)[argv[2].value];
+  if (regexp) {
+    function getRegExp(){
+      return regex;
     }
   }
+  else {
+    function getRegExp(){
+      return new RegExp(argv[0].value)
+    }
+  }
+
+  if (argv == 2) {
+    function udf(){
+      return getRegExp().test(argv[1].value) ?  1 : 0;
+    }
+  }
+  else {
+    function udf(){
+      return getRegExp().exec(argv[1].value)[argv[2].value];
+    }
+  }
+
 ', '')
 ,('count_all', 'jsagg', '
   var count;
