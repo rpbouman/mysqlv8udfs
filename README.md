@@ -17,7 +17,15 @@ This is the line that works for me:
 
     g++ -Wall -I include -I /home/rbouman/mysql/mysql/include -shared -fPIC -DMYSQL_DYNAMIC_PLUGIN -o mysqlv8udfs.so mysqlv8udfs.cpp /usr/lib/libv8.so ~/mysql/mysql/lib/libmysqlclient.so
 
-(I'm on KUbuntu 12.10, and I installed mysql 5.6 in ~/mysql/mysql. I also installed the g++ and libv8-dev packages using Ubuntu Software Center)
+(This works on KUbuntu 12.10 LTS, and on Ubuntu 13 Saucy. In my case, mysql is installed (from tar.gz archive) in ~/mysql/mysql. I tried with both MySQL 5.6 and MySQL 5.7. I also installed the g++ and libv8-dev packages using Ubuntu Software Center. v8 version: libv8-3.14, g++ 4.8.1-2)
+
+Here's some info from Rahul Chitturi to get it working on Mac OSX:
+
+    g++ -Wall -I include -I  /usr/local/Cellar/mysql/5.6.14/include/mysql -dynamiclib -o mysqlv8udfs.dylib mysqlv8udfs.cpp /usr/local/Cellar/v8/3.15.11/lib/libv8.dylib /usr/local/Cellar/mysql/5.6.14/lib/libmysqlclient.dylib
+
+(Obviously, you should modify the paths to match the location of MySQL and libv8 on your system)
+
+WARNING: It seems OSX comes with a newer version of v8, like 3.21.17 or higher. Unfortunately, this currently won't compile. 
 
 Hopefully I can manage to wrap my head around libtool and autoconf and whatnot so I can come up with a build process that works for everybody. If anybody would like to contribute that, then please go ahead, I'd welcome it with open arms :).
 
