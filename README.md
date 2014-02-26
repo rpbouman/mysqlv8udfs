@@ -22,19 +22,19 @@ This is the line that works for me:
 Here are the exact steps that MAC Users can use for building dylib from your code:
 
 Dependencies:
-1. Brew
+1.  Brew
     Installation: ruby -e "$(curl -fsSL https://raw.github.com/Homebrew/homebrew/go/install)”
-2. MySQL 
+2.  MySQL 
     Installation : brew install mysql
     Tested Version:  5.6.14, could work with any mysql 5.6 versions
-3. V8 Engine -  3.15.11
+3.  V8 Engine -  3.15.11
     Installation steps:
-    1. brew versions v8 - This will list out all versions of v8 that brew has
+    1.  brew versions v8 - This will list out all versions of v8 that brew has
     We are interested in version 3.15.11
-    2. cd `brew —prefix`
-    3. git checkout cb30f36 Library/Formula/v8.rb
-    4. brew install v8
-    5. g++ -Wall -I include -I  /usr/local/Cellar/mysql/5.6.14/include/mysql -dynamiclib -o mysqlv8udfs.dylib -DMYSQL_DYNAMIC_PLUGIN mysqlv8udfs.cpp /usr/local/Cellar/v8/3.15.11/lib/libv8.dylib /usr/local/Cellar/mysql/5.6.14/lib/libmysqlclient.dylib 
+    2.  cd `brew —prefix`
+    3.  git checkout cb30f36 Library/Formula/v8.rb
+    4.  brew install v8
+    5.  g++ -Wall -I include -I  /usr/local/Cellar/mysql/5.6.14/include/mysql -dynamiclib -o mysqlv8udfs.dylib -DMYSQL_DYNAMIC_PLUGIN mysqlv8udfs.cpp /usr/local/Cellar/v8/3.15.11/lib/libv8.dylib /usr/local/Cellar/mysql/5.6.14/lib/libmysqlclient.dylib 
 
 (you should modify the paths to match the location of MySQL and libv8 on your system, and the install.sql has to be changed to read from .dylib instead of .so's)
 
