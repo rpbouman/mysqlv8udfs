@@ -22,6 +22,7 @@ This is the line that works for me:
 Here are the exact steps that MAC Users can use for building dylib from your code:
 
 Dependencies:
+
 1.  Brew
     Installation: ruby -e "$(curl -fsSL https://raw.github.com/Homebrew/homebrew/go/install)”
 2.  MySQL 
