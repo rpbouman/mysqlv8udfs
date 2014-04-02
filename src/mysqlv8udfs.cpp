@@ -526,7 +526,7 @@ my_bool setupArguments(V8RES *v8res, UDF_ARGS* args, char *message, my_bool argu
     }
   }
   v8::Handle<v8::Value> arg_value;
-  //v8::Persistent<v8:Value> persistent_arg_value;
+  v8::Persistent<v8::Value> persistent_arg_value;
 
   v8::Local<v8::Array> arguments = v8::Array::New(args->arg_count - 1);
   if (arguments.IsEmpty()) {
@@ -589,7 +589,7 @@ my_bool setupArguments(V8RES *v8res, UDF_ARGS* args, char *message, my_bool argu
       //wipe out the extractor - we don't need it anymore now we have the value
       v8res->arg_extractors[i] = NULL;
       //TODO: make the argument value persistent, we need it for multiple calls.
-      //persistent_arg_value = v8::Persistent<v8::Value>::New(arg_value);
+      persistent_arg_value = v8::Persistent<v8::Value>::New(arg_value);
     }
     if (argumentObjects == TRUE) {
       v8::Local<v8::Object> argumentObject = v8::Object::New();
@@ -601,15 +601,17 @@ my_bool setupArguments(V8RES *v8res, UDF_ARGS* args, char *message, my_bool argu
       if (args->args[i] == NULL) {  //value is NULL: either non-constant, or NULL
         if (args->maybe_null[i] == TRUE && args->lengths[i] == 0) { //value maybe null, and max_length is 0 (never not NULL)
           argumentObject->Set(str_const_item, v8::True());
+          v8res->arg_values[i-1] = persistent_arg_value;
         }
         else {  //value is NULL but max_length not. So this can't be a constant item.
           argumentObject->Set(str_const_item, v8::False());
+          v8res->arg_values[i-1] = arg_value;
         }
       }
       else {  //we have a value - this means it's a constant item.
         argumentObject->Set(str_const_item, v8::True());
+        v8res->arg_values[i-1] = persistent_arg_value;
       }
-      v8res->arg_values[i-1] = arg_value;
       argumentObject->Set(str_value, arg_value);
       arg_value = argumentObject;
     }
@@ -2455,11 +2457,23 @@ void js_deinit(UDF_INIT *initid){
   V8RES *v8res = (V8RES *)initid->ptr;
   if (v8res->result != NULL && v8res->max_result_length != 0) {
     free(v8res->result);
+    v8res->result = NULL;
   }
-  if (v8res->arg_extractors != NULL) free(v8res->arg_extractors);
-  if (v8res->arg_values != NULL) free(v8res->arg_values);
   //v8 introductory voodoo incantations
   v8::Locker locker;
+  if (v8res->arg_extractors != NULL) {
+    for (unsigned int i = 0; i < v8res->arguments->Length(); i++) {
+      if (v8res->arg_extractors[i] == NULL) {
+        ((v8::Persistent<v8::Value>)v8res->arg_values[i]).Dispose();
+      }
+    }
+    free(v8res->arg_extractors);
+    v8res->arg_extractors = NULL;
+  }
+  if (v8res->arg_values != NULL) {
+    free(v8res->arg_values);
+    v8res->arg_values = NULL;
+  }
   if (v8res->compiled & COMPILED_YES) {
     v8res->script.Dispose();
   }
