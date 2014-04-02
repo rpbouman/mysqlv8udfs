@@ -855,22 +855,29 @@ v8::Handle<v8::Value> msyqlQueryResultSetInternalDoneGetter(v8::Handle<v8::Objec
 }
 
 void cleanupMysqlQueryResultSet(v8::Handle<v8::Object> mysqlQueryResultSet){
+  LOG_ERR("cleanupMysqlQueryResultSet");
   MYSQL_RES* mysql_res = mysqlQueryResultSetInternalMysqlResGetter(mysqlQueryResultSet);
-  if (mysql_res == NULL) return;
+  if (mysql_res == NULL) {
+    LOG_ERR("mysql_res is NULL, bailing.");
+    return;
+  }
+  LOG_ERR("exhaust resultset");
   //exhaust the result set.
   while (mysql_fetch_row(mysql_res));
   //free the result
+  LOG_ERR("free resultset");
   mysql_free_result(mysql_res);
   //null the pointer
+  LOG_ERR("wipe out the resultset pointer.");
   mysqlQueryResultSet->SetInternalField(0, v8::External::New(NULL));
 }
 
 void msyqlQueryResultSetInternalDoneSetter(v8::Handle<v8::Object> mysqlQueryResultSet, my_bool value){
   //set the actual field
   mysqlQueryResultSet->SetInternalField(1, value ? v8::True() : v8::False());
-  //if (value == TRUE) {
-  //  cleanupMysqlQueryResultSet(mysqlQueryResultSet);
-  //}
+  if (value == TRUE) {
+    cleanupMysqlQueryResultSet(mysqlQueryResultSet);
+  }
 }
 
 void mysqlQueryResultSetDoneSetter(v8::Local<v8::String> property, v8::Local<v8::Value> value, const v8::AccessorInfo& info){
@@ -960,11 +967,13 @@ void mysqlQueryNextResult(v8::Handle<v8::Object> mysqlQuery){
   MYSQL *mysql = getMySQLConnectionInternal(mysqlQuery);
   LOG_ERR("Check for more...");
   my_bool hasMore = mysql_more_results(mysql);
-  LOG_ERR(hasMore ? "we have more" : "we don't have more");
+  fprintf(stderr, "\n%i", hasMore);
+  LOG_ERR(hasMore ? "we have more " : "we don't have more");
   if (!hasMore) {
     msyqlQueryInternalDoneSetter(mysqlQuery, v8::False());
     return;
   }
+
   LOG_ERR("Get next result");
   int more_results = mysql_next_result(mysql);
   if (more_results > 0) {
@@ -980,14 +989,18 @@ void mysqlQueryResultSetFetch(v8::Handle<v8::Object> mysqlQueryResultSet) {
   MYSQL_RES *mysql_res = mysqlQueryResultSetInternalMysqlResGetter(mysqlQueryResultSet);
   LOG_ERR("Getting a row");
   MYSQL_ROW mysql_row = mysql_fetch_row(mysql_res);
-  if (mysql_row != NULL) {
+  if (mysql_row == NULL) {
+    LOG_ERR("No more rows...");
+  }
+  else {
     LOG_ERR("There are more rows still...");
     mysqlQueryResultSetInternalMysqlRowSetter(mysqlQueryResultSet, mysql_row);
     return;
   }
+  LOG_ERR("Setting done on the resultset");
   msyqlQueryResultSetInternalDoneSetter(mysqlQueryResultSet, TRUE);
-
-  mysqlQueryNextResult(mysqlQueryResultSet->GetInternalField(3)->ToObject());
+  //LOG_ERR("Getting the next result");
+  //mysqlQueryNextResult(mysqlQueryResultSet->GetInternalField(3)->ToObject());
 }
 
 v8::Handle<v8::Value> mysqlQueryResultSetField(const v8::Arguments& args) {
@@ -1406,9 +1419,7 @@ v8::Handle<v8::Value> mysqlImmediateQueryResult(v8::Local<v8::Object> mysqlQuery
   LOG_ERR("Getting a result. Use or store: ");
   LOG_ERR(useOrStore ? "store" : "use");
   //get the actual result.
-  LOG_ERR("Get connection");
   MYSQL *mysql = getMySQLConnectionInternal(mysqlQuery);
-  LOG_ERR("Get result");
   MYSQL_RES *mysql_res = useOrStore ? mysql_store_result(mysql) : mysql_use_result(mysql);
 
   if (mysql_res == NULL) {
