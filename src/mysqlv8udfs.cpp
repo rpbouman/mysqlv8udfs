@@ -2461,10 +2461,14 @@ void js_deinit(UDF_INIT *initid){
   }
   //v8 introductory voodoo incantations
   v8::Locker locker;
+  //clean up extractors
   if (v8res->arg_extractors != NULL) {
-    for (unsigned int i = 0; i < v8res->arguments->Length(); i++) {
-      if (v8res->arg_extractors[i] == NULL) {
-        ((v8::Persistent<v8::Value>)v8res->arg_values[i]).Dispose();
+    if (v8res->arg_values != NULL) {
+      //clean up any persistent arg_values.
+      for (unsigned int i = 0; i < v8res->arguments->Length(); i++) {
+        if (v8res->arg_extractors[i] == NULL) {
+          ((v8::Persistent<v8::Value>)v8res->arg_values[i]).Dispose();
+        }
       }
     }
     free(v8res->arg_extractors);
