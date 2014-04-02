@@ -59,6 +59,7 @@ unsigned long JS_INITIAL_RETURN_VALUE_LENGTH  = 255;
 #define MSG_FIELD_INDEX_MUST_BE_INT                 "Field index argument should be an unsigned integer"
 #define MSG_EXPECTED_ZERO_ARGUMENTS                 "No arguments allowed"
 #define MSG_EXPECTED_ONE_ARGUMENT                   "Expect at most 1 argument"
+#define MSG_EXPECTED_AT_LEAST_ONE_ARGUMENT          "Expect at least 1 argument"
 #define MSG_TOO_MANY_ARGUMENTS                      "Too many arguments"
 #define MSG_ARG_MUST_BE_ARRAY_OR_OBJECT_OR_FUNCTION "Argument must be either an array or an object or a function"
 #define MSG_ARG_MUST_BE_STRING                      "Argument must be a string"
@@ -203,6 +204,8 @@ static v8::Persistent<v8::String> str_failed_to_allocate_field_extractors;
 static v8::Persistent<v8::String> str_resultset_already_consumed;
 static v8::Persistent<v8::String> str_query_not_yet_done;
 static v8::Persistent<v8::String> str_results_already_consumed;
+
+static v8::Persistent<v8::Function> function_json_valid;
 
 static char* js_module_path;
 static v8::Persistent<v8::Context> jsDaemonContext;
@@ -514,6 +517,7 @@ my_bool setupArguments(V8RES *v8res, UDF_ARGS* args, char *message, my_bool argu
     strcpy(message, MSG_V8_ALLOCATION_FAILED);
     return INIT_ERROR;
   }
+
   if (argumentObjects == TRUE) {
     v8res->arg_values = (v8::Handle<v8::Value> *)malloc((args->arg_count - 1) * sizeof(v8::Handle<v8::Value>));
     if (v8res->arg_values == NULL) {
@@ -522,6 +526,7 @@ my_bool setupArguments(V8RES *v8res, UDF_ARGS* args, char *message, my_bool argu
     }
   }
   v8::Handle<v8::Value> arg_value;
+  //v8::Persistent<v8:Value> persistent_arg_value;
 
   v8::Local<v8::Array> arguments = v8::Array::New(args->arg_count - 1);
   if (arguments.IsEmpty()) {
@@ -537,7 +542,7 @@ my_bool setupArguments(V8RES *v8res, UDF_ARGS* args, char *message, my_bool argu
     ARG_EXTRACTOR arg_extractor;
     my_bool was_decimal = FALSE;
     switch (args->arg_type[i]) {
-      case ROW_RESULT:
+      case ROW_RESULT:  //shouldn't arrive here, but if we do, handle as string.
         args->arg_type[i] = STRING_RESULT;
       case STRING_RESULT:
         arg_extractor = getStringArgValue;
@@ -581,7 +586,10 @@ my_bool setupArguments(V8RES *v8res, UDF_ARGS* args, char *message, my_bool argu
       else {
         arg_value = (*arg_extractor)(args, i);
       }
+      //wipe out the extractor - we don't need it anymore now we have the value
       v8res->arg_extractors[i] = NULL;
+      //TODO: make the argument value persistent, we need it for multiple calls.
+      //persistent_arg_value = v8::Persistent<v8::Value>::New(arg_value);
     }
     if (argumentObjects == TRUE) {
       v8::Local<v8::Object> argumentObject = v8::Object::New();
@@ -620,10 +628,16 @@ void updateArgumentObjects(V8RES *v8res, UDF_ARGS* args){
     //if this is a constant argument,
     //the value is already set in the init function
     //so we can skip it.
-    if (arg_extractor == NULL) continue;
+    if (arg_extractor == NULL) {
+      continue;
+    }
     //extract and store the argument value
-    if (args->args[i] == NULL) val = v8::Null();
-    else val = (*arg_extractor)(args, i);
+    if (args->args[i] == NULL) {
+      val = v8::Null();
+    }
+    else {
+      val = (*arg_extractor)(args, i);
+    }
     v8res->arg_values[i - 1] = val;
     v8res->arguments->Get(i - 1)->ToObject()->Set(str_value, val);
   }
@@ -674,10 +688,16 @@ void assignArguments(V8RES *v8res, UDF_ARGS* args) {
     //if this is a constant argument,
     //the value is already set in the init function
     //so we can skip it.
-    if (arg_extractor == NULL) continue;
+    if (arg_extractor == NULL) {
+      continue;
+    }
     //extract and store the argument value
-    if (args->args[i] == NULL) val = v8::Null();
-    else val = (*arg_extractor)(args, i);
+    if (args->args[i] == NULL) {
+      val = v8::Null();
+    }
+    else {
+      val = (*arg_extractor)(args, i);
+    }
     v8res->arguments->Set(i - 1, val);
   }
 }
@@ -2212,8 +2232,12 @@ extern "C" {
 //called once by the mysql server
 //before running the udf row level function
 my_bool js_init(UDF_INIT *initid, UDF_ARGS *args, char *message){
-  if (js_check_arguments(args, message) == INIT_ERROR) return INIT_ERROR;
-  if (js_alloc_resources(initid, args, message) == INIT_ERROR) return INIT_ERROR;
+  if (js_check_arguments(args, message) == INIT_ERROR) {
+    return INIT_ERROR;
+  }
+  if (js_alloc_resources(initid, args, message) == INIT_ERROR) {
+    return INIT_ERROR;
+  }
   js_set_initid_defaults(initid);
 
   //v8 introductory voodoo incantations
@@ -2230,9 +2254,13 @@ my_bool js_init(UDF_INIT *initid, UDF_ARGS *args, char *message){
   v8res->context->Enter();
 
   //create and initialize arguments array
-  if (setupArguments(v8res, args, message, FALSE) == INIT_ERROR) return INIT_ERROR;
+  if (setupArguments(v8res, args, message, FALSE) == INIT_ERROR) {
+    return INIT_ERROR;
+  }
 
-  if (js_pre_compile(initid, args, message) == INIT_ERROR) return INIT_ERROR;
+  if (js_pre_compile(initid, args, message) == INIT_ERROR) {
+    return INIT_ERROR;
+  }
 
   v8res->context->Exit();
 
@@ -2241,15 +2269,21 @@ my_bool js_init(UDF_INIT *initid, UDF_ARGS *args, char *message){
 
 my_bool jserr_init(UDF_INIT *initid, UDF_ARGS *args, char *message) {
   if (js_init(initid, args, message) == INIT_ERROR) {
-    if (strcmp(message, MSG_SCRIPT_COMPILATION_FAILED)) return INIT_ERROR;
+    if (strcmp(message, MSG_SCRIPT_COMPILATION_FAILED)) {
+      return INIT_ERROR;
+    }
   }
   return INIT_SUCCESS;
 }
 
 //The jsudf init function
 my_bool jsudf_init(UDF_INIT *initid, UDF_ARGS *args, char *message){
-  if (js_check_arguments(args, message) == INIT_ERROR) return INIT_ERROR;
-  if (js_alloc_resources(initid, args, message) == INIT_ERROR) return INIT_ERROR;
+  if (js_check_arguments(args, message) == INIT_ERROR) {
+    return INIT_ERROR;
+  }
+  if (js_alloc_resources(initid, args, message) == INIT_ERROR) {
+    return INIT_ERROR;
+  }
   js_set_initid_defaults(initid);
 
   //v8 introductory voodoo incantations
@@ -2266,9 +2300,13 @@ my_bool jsudf_init(UDF_INIT *initid, UDF_ARGS *args, char *message){
   v8res->context->Enter();
 
   //create and initialize arguments array
-  if (setupArguments(v8res, args, message, TRUE) == INIT_ERROR) return INIT_ERROR;
+  if (setupArguments(v8res, args, message, TRUE) == INIT_ERROR) {
+    return INIT_ERROR;
+  }
 
-  if (js_pre_compile(initid, args, message) == INIT_ERROR) return INIT_ERROR;
+  if (js_pre_compile(initid, args, message) == INIT_ERROR) {
+    return INIT_ERROR;
+  }
   if (v8res->compiled != COMPILED_YES) {
     strcpy(message, MSG_STATIC_SCRIPT_REQUIRED);
     return INIT_ERROR;
@@ -2367,6 +2405,45 @@ my_bool jsagg_init(UDF_INIT *initid, UDF_ARGS *args, char *message){
 
   v8res->context->Exit();
   return INIT_SUCCESS;
+}
+
+my_bool json_valid_init(UDF_INIT *initid, UDF_ARGS *args, char *message) {
+LOG_ERR("enter Init json_valid");
+  if (args->arg_count == 0) {
+    strcpy(message, MSG_EXPECTED_AT_LEAST_ONE_ARGUMENT);
+    return INIT_ERROR;
+  }
+  for (unsigned int i = 0; i < args->arg_count; i++) {
+LOG_ERR("setting arg data type");
+    *args->arg_type = STRING_RESULT;
+  }
+LOG_ERR("exit Init json_valid");
+  return INIT_SUCCESS;
+}
+
+long long json_valid(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char *error) {
+LOG_ERR("enter json_valid");
+  v8::Handle<v8::Value> js_arg;
+  v8::Handle<v8::Value> result;
+  jsDaemonContext->Enter();
+  for (unsigned int i = 0; i < args->arg_count; i++) {
+LOG_ERR("setting up argument");
+    js_arg = v8::String::New(args->args[i], args->lengths[i]);
+LOG_ERR("calling function");
+    result = function_json_valid->Call(jsDaemonContext->Global(), 1, &js_arg);
+LOG_ERR("checking result");
+    if (result->IsFalse()) {
+LOG_ERR("FALSE!");
+LOG_ERR("exiting context");
+      jsDaemonContext->Exit();
+      return 0;
+    }
+  }
+LOG_ERR("TRUE!");
+LOG_ERR("exiting context");
+  jsDaemonContext->Exit();
+LOG_ERR("exit json_valid");
+  return 1;
 }
 
 //the udf deinit function.
@@ -2789,6 +2866,25 @@ static struct st_mysql_daemon mysql_daemon_plugin_info = {
   MYSQL_DAEMON_INTERFACE_VERSION
 };
 
+v8::Persistent<v8::Function> create_function(char *js){
+LOG_ERR("entering create function");
+  v8::Local<v8::String> source = v8::String::New(js);
+LOG_ERR("entering creating script");
+  v8::Local<v8::Script> script = v8::Script::New(source);
+LOG_ERR("entering running script");
+  v8::Local<v8::Value> value = script->Run();
+LOG_ERR("checking function");
+  v8::Handle<v8::Function> function;
+  if (value->IsFunction()){
+    function = v8::Handle<v8::Function>::Cast(value);
+  }
+  else {
+    LOG_ERR("Not a function");
+  }
+LOG_ERR("persisting function");
+  return v8::Persistent<v8::Function>::New(function);
+}
+
 static int js_daemon_plugin_init(MYSQL_PLUGIN){
   LOG_ERR(MSG_JS_DAEMON_STARTUP);
 
@@ -2903,6 +2999,8 @@ static int js_daemon_plugin_init(MYSQL_PLUGIN){
   str_resultset_already_consumed = v8::Persistent<v8::String>::New(v8::String::New(MSG_RESULTSET_ALREADY_EXHAUSTED));
   str_query_not_yet_done = v8::Persistent<v8::String>::New(v8::String::New(MSG_QUERY_NOT_YET_DONE));
   str_results_already_consumed = v8::Persistent<v8::String>::New(v8::String::New(MSG_RESULTS_ALREADY_CONSUMED));
+
+  function_json_valid = create_function((char *)"var json_valid = function(){var i, n = arguments.length; try {for (i = 0; i < n; i++) JSON.parse(arguments[i]);}catch(e){return false;} return true;}; json_valid;");
 
   mysqlExceptionTemplate = createMysqlExceptionTemplate();
   mysqlQueryResultSetTemplate = createMysqlQueryResultSetTemplate();
@@ -3045,6 +3143,8 @@ static int js_daemon_plugin_deinit(MYSQL_PLUGIN){
   str_resultset_already_consumed.Dispose();
   str_query_not_yet_done.Dispose();
   str_results_already_consumed.Dispose();
+
+  function_json_valid.Dispose();
 
   clear_module_cache();
 
