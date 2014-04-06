@@ -48,7 +48,7 @@ unsigned long JS_INITIAL_RETURN_VALUE_LENGTH  = 255;
 #define MSG_JS_DAEMON_STARTUP           "JS daemon starting..."
 #define MSG_JS_DAEMON_STARTED           "JS daemon started."
 #define MSG_JS_DAEMON_SHUTTING_DOWN     "JS daemon shutting down."
-#define MSG_JS_DAEMON_SHUTDOWN          "JS daemon shutdown."
+#define MSG_JS_DAEMON_SHUTDOWN          "JS daemon has shut down."
 #define MSG_OK                          "Ok."
 #define MSG_STRING_CONVERSION_FAILED    "<string conversion failed>"
 
@@ -3193,7 +3193,7 @@ static int js_daemon_plugin_deinit(MYSQL_PLUGIN){
 
   jsDaemonContext->Exit();
   jsDaemonContext.Dispose();
-  v8::V8::Dispose();
+  //v8::V8::Dispose();
 
   LOG_ERR(MSG_JS_DAEMON_SHUTDOWN);
   return 0;
