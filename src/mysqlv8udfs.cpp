@@ -375,8 +375,8 @@ cleanup_file:
 
 my_bool check_script_filename(char *file_name){
   //TODO: checks if this is a valid file name
-  //* at a minimum, file name must not break free from module dir.
-  //* additional check: extension must be .js?
+  // - at a minimum, file name must not break free from module dir.
+  // - additional check: extension must be .js?
   return TRUE;
 }
 
@@ -950,6 +950,17 @@ v8::Handle<v8::Value> mysqlQueryResultSetTypeGetter(v8::Local<v8::String> proper
   return str_resultset;
 }
 
+v8::Handle<v8::Value> mysqlQueryResultSetRowCountGetter(v8::Local<v8::String> property, const v8::AccessorInfo& info){
+  v8::Handle<v8::Object> mysqlQueryResultSet = info.Holder();
+  MYSQL_RES *mysql_res = mysqlQueryResultSetInternalMysqlResGetter(mysqlQueryResultSet);
+  if (mysql_res == NULL) {
+    throwError(str_resultset_already_exhausted);
+    return v8::Null();
+  }
+  my_ulonglong rowCount = mysql_num_rows(mysql_res);
+  return v8::Number::New(rowCount);
+}
+
 MYSQL_ROW mysqlQueryResultSetInternalMysqlRowGetter(v8::Handle<v8::Object> mysqlQueryResultSet){
   return (MYSQL_ROW)v8::Local<v8::External>::Cast(mysqlQueryResultSet->GetInternalField(4))->Value();
 }
@@ -1166,6 +1177,7 @@ v8::Persistent<v8::ObjectTemplate> createMysqlQueryResultSetTemplate(){
   _mysqlQueryResultSetTemplate->SetInternalFieldCount(7);
   _mysqlQueryResultSetTemplate->SetAccessor(str_done, mysqlQueryResultSetDoneGetter, mysqlQueryResultSetDoneSetter);
   _mysqlQueryResultSetTemplate->SetAccessor(str_type, mysqlQueryResultSetTypeGetter, setConstant);
+  _mysqlQueryResultSetTemplate->SetAccessor(str_rowcount, mysqlQueryResultSetRowCountGetter, setConstant);
   _mysqlQueryResultSetTemplate->SetAccessor(v8::String::New("fieldCount"), mysqlQueryResultSetFieldCountGetter, setConstant);
   _mysqlQueryResultSetTemplate->SetAccessor(v8::String::New("buffered"), mysqlQueryResultSetBufferedGetter, setConstant);
   _mysqlQueryResultSetTemplate->Set(v8::String::New("field"), v8::FunctionTemplate::New(mysqlQueryResultSetField));
