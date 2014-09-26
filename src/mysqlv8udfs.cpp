@@ -8,6 +8,15 @@
 #include "plugin.h"
 #include "v8.h"
 
+#ifndef MYSQL_PLUGIN
+typedef void * MYSQL_PLUGIN;
+#endif
+
+#if !defined(NOT_FIXED_DEC)
+#define NOT_FIXED_DEC           31
+#endif
+
+
 #define TRUE                            1
 #define FALSE                           0
 #define STR_TRUE                        "true"

@@ -98,10 +98,11 @@ where jsudf('
 select jsudf('
   var conn, query1, query2;
   function init(){
+    console.log("Establishing connection");
     conn = mysql.client.connect({
       host: "localhost",
-//      port: 3306,
-      socket: "/home/rbouman/mysql/mysqld.sock",
+      port: 3306,
+//      socket: "/home/rbouman/mysql/mysqld.sock",
       user: "sakila",
       password: "sakila",
       schema: "sakila"
@@ -109,23 +110,33 @@ select jsudf('
   }
 
   function udf(inventory_id){
-
-    var query, result, rows, ret = [];
-    query = conn.query(
-      "SELECT film_id " +
-      "FROM film " +
-      "LIMIT 0"
-    );
-    query.execute();
-    while (!query.done) {
-      rows = [];
-      ret.push(rows);
-      result = query.result();
-      while (!result.done) {
-        rows.push(result.fetchArray([]));
-      };
+    try {
+      var query, result, rows, ret = [];
+      query = conn.query(
+        "SELECT film_id " +
+        "FROM film " +
+        "LIMIT 1"
+      );
+      query.execute();
+      while (!query.done) {
+        rows = [];
+        ret.push(rows);
+        result = query.result();
+        console.log("row count: " + result.rowCount);
+        while (!result.done) {
+          rows.push(result.row());
+        };
+      }
+      return JSON.stringify(rows, null, 2);
     }
+    catch (exception) {
+      console.log("Whoops, exception");
+      return JSON.stringify(exception, null, 2);
+    }
+  }
 
-    return JSON.stringify(rows, null, 2);
+  function deinit(){
+    console.log("Closing connection");
+    conn.close();
   }
 ');
